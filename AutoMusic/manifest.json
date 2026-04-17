@@ -1,0 +1,12 @@
+{
+    "display_name": "AutoMusic",
+    "loading_order": 15,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "AutoMusic",
+    "version": "1.6.0",
+    "homePage": "",
+    "auto_update": false
+}
