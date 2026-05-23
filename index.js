@@ -1,5 +1,5 @@
 /**
- * AutoMusic v1.8.0 — Stable Audio 3.0 support, per-channel engine selection
+ * AutoMusic v1.9.0 — per-engine settings memory
  */
 import {
     eventSource, event_types, getRequestHeaders,
@@ -24,11 +24,29 @@ var TIME_SIGS = ['2','3','4','6'];
 // 'stable_audio'    — Stable Audio Open 1.0  (text prompt, no music theory params)
 // 'ace_step'        — ACE Step v1.5          (full music: bpm / keyscale / timesig / unet)
 // 'stable_audio_3'  — Stable Audio 3.0       (text prompt, can do music & SFX/ambient)
+//
+// `defaults` hold the recommended duration/steps/cfg per engine *per channel*.
+// They are used to seed engineParams[channel][engine] the first time an engine
+// is selected, so each engine remembers its own optimal settings.
 var ENGINES = {
-    stable_audio:   { label: 'Stable Audio Open 1.0', musicParams: false },
-    ace_step:       { label: 'ACE Step v1.5',         musicParams: true  },
-    stable_audio_3: { label: 'Stable Audio 3.0',      musicParams: false },
+    stable_audio: {
+        label: 'Stable Audio Open 1.0', musicParams: false,
+        defaults: { ambient: { duration: 60, steps: 50, cfg: 5 }, music: { duration: 120, steps: 50, cfg: 5 } },
+    },
+    ace_step: {
+        label: 'ACE Step v1.5', musicParams: true,
+        defaults: { ambient: { duration: 60, steps: 8, cfg: 1 }, music: { duration: 120, steps: 8, cfg: 1 } },
+    },
+    stable_audio_3: {
+        label: 'Stable Audio 3.0', musicParams: false,
+        defaults: { ambient: { duration: 60, steps: 8, cfg: 1 }, music: { duration: 120, steps: 8, cfg: 1 } },
+    },
 };
+function engineDefaults(channel, engine) {
+    var e = ENGINES[engine] || ENGINES.stable_audio;
+    var d = (e.defaults && e.defaults[channel]) || { duration: 60, steps: 8, cfg: 1 };
+    return { duration: d.duration, steps: d.steps, cfg: d.cfg };
+}
 
 /* ============ DEFAULTS ============ */
 var DEFAULTS = {
@@ -51,6 +69,9 @@ var DEFAULTS = {
     musicSa3Workflow: '',
     sa3CheckpointModel: 'stable_audio_3_medium.safetensors',
     musicUnetModel: 'acestep_v1.5_xl_sft_bf16.safetensors',
+    // v1.9: per-engine, per-channel duration/steps/cfg so each engine keeps its own
+    // optimal settings. Shape: engineParams[channel][engine] = {duration, steps, cfg}
+    engineParams: {},
     musicPresets: {},
     ambientDuration: 60,
     musicDuration: 120,
@@ -116,9 +137,62 @@ function loadSettings() {
         if (!s.musicEngine) s.musicEngine = 'ace_step';
         s._migrated_v18_engine = true;
     }
+    // v1.9: seed per-engine params. The current flat duration/steps/cfg values are
+    // adopted as the settings for whatever engine is *currently* active on each
+    // channel, so nothing changes for the user until they switch engines.
+    if (!s.engineParams || typeof s.engineParams !== 'object') s.engineParams = {};
+    if (!s._migrated_v19_engine_params) {
+        s.engineParams.ambient = s.engineParams.ambient || {};
+        s.engineParams.music = s.engineParams.music || {};
+        var ambEng0 = s.ambientEngine || 'stable_audio';
+        var musEng0 = s.musicEngine || 'ace_step';
+        if (!s.engineParams.ambient[ambEng0]) {
+            s.engineParams.ambient[ambEng0] = { duration: s.ambientDuration, steps: s.ambientSteps, cfg: s.ambientCfg };
+        }
+        if (!s.engineParams.music[musEng0]) {
+            s.engineParams.music[musEng0] = { duration: s.musicDuration, steps: s.musicSteps, cfg: s.musicCfg };
+        }
+        s._migrated_v19_engine_params = true;
+    }
 
     if (!s.savedTracks) s.savedTracks = {};
     if (!s.musicPresets) s.musicPresets = {};
+}
+
+/* ============ PER-ENGINE PARAMS ============ */
+// Return the {duration,steps,cfg} for a channel's *currently selected* engine,
+// creating the entry from the engine's recommended defaults if it doesn't exist.
+function getEngineParams(channel) {
+    var s = S();
+    var engine = (channel === 'ambient') ? (s.ambientEngine || 'stable_audio') : (s.musicEngine || 'ace_step');
+    if (!s.engineParams) s.engineParams = {};
+    if (!s.engineParams[channel]) s.engineParams[channel] = {};
+    if (!s.engineParams[channel][engine]) {
+        s.engineParams[channel][engine] = engineDefaults(channel, engine);
+    }
+    var p = s.engineParams[channel][engine];
+    // Backfill any missing field from defaults (robustness against partial data).
+    var def = engineDefaults(channel, engine);
+    if (p.duration === undefined) p.duration = def.duration;
+    if (p.steps === undefined) p.steps = def.steps;
+    if (p.cfg === undefined) p.cfg = def.cfg;
+    return p;
+}
+function setEngineParam(channel, key, value) {
+    var p = getEngineParams(channel);
+    p[key] = value;
+    // Keep the flat ambientX/musicX fields in sync with the active engine, so the
+    // rest of the codebase (generation, presets) keeps working unchanged.
+    syncFlatParams(channel);
+}
+// Mirror the active engine's params into the legacy flat fields used elsewhere.
+function syncFlatParams(channel) {
+    var s = S(), p = getEngineParams(channel);
+    if (channel === 'ambient') {
+        s.ambientDuration = p.duration; s.ambientSteps = p.steps; s.ambientCfg = p.cfg;
+    } else {
+        s.musicDuration = p.duration; s.musicSteps = p.steps; s.musicCfg = p.cfg;
+    }
 }
 
 /* ============ STATE ============ */
@@ -447,7 +521,7 @@ function fillSa3Workflow(wfStr, prompt, duration, steps, cfg, musicParams) {
 }
 
 function fillMusicWorkflow(wfStr, prompt, musicParams) {
-    var t = wfStr, s = S();
+    var t = wfStr, s = S(), mp = getEngineParams('music');
     var bpm = (musicParams && musicParams.bpm) ? musicParams.bpm : randInt(80, 160);
     var keyscale = (musicParams && musicParams.keyscale) ? musicParams.keyscale : randPick(KEYSCALES);
     var timesig = (musicParams && musicParams.timesignature) ? String(musicParams.timesignature) : randPick(TIME_SIGS);
@@ -460,7 +534,7 @@ function fillMusicWorkflow(wfStr, prompt, musicParams) {
         '%keyscale%': escJ(keyscale), '%timesignature%': escJ(timesig),
         '%unet_name%': escJ(s.musicUnetModel || 'acestep_v1.5_xl_sft_bf16.safetensors')
     };
-    var numMap = { '%seed%': Math.floor(Math.random() * 2147483647), '%steps%': s.musicSteps || 8, '%cfg%': s.musicCfg || 1, '%duration%': s.musicDuration || 120, '%bpm%': bpm, '%denoise%': 1 };
+    var numMap = { '%seed%': Math.floor(Math.random() * 2147483647), '%steps%': mp.steps || 8, '%cfg%': mp.cfg || 1, '%duration%': mp.duration || 120, '%bpm%': bpm, '%denoise%': 1 };
     for (var key in strMap) t = t.split(key).join(strMap[key]);
     for (var key in numMap) { var v = String(numMap[key]); t = t.split('"' + key + '"').join(v); t = t.split(key).join(v); }
     try { return JSON.parse(t); } catch (e) { console.error(L, 'Music WF error:', e.message); return null; }
@@ -474,23 +548,20 @@ async function generateAudioQueued(type, prompt, musicParams) {
 async function generateAudioDirect(type, prompt, musicParams) {
     var s = S(), base = getComfyUrl().replace(/\/+$/, ''), obj;
     var engine = (type === 'ambient') ? (s.ambientEngine || 'stable_audio') : (s.musicEngine || 'ace_step');
+    // Source of truth: the active engine's own saved params for this channel.
+    var ep = getEngineParams(type);
 
     if (engine === 'stable_audio_3') {
         // Per-channel custom SA3 workflow overrides the built-in default.
         var sa3Custom = (type === 'ambient') ? s.ambientSa3Workflow : s.musicSa3Workflow;
-        var dur = (type === 'ambient') ? s.ambientDuration : s.musicDuration;
-        var steps = (type === 'ambient') ? s.ambientSteps : s.musicSteps;
-        var cfg = (type === 'ambient') ? s.ambientCfg : s.musicCfg;
         // Music channel may carry bpm/keyscale to fold into the SA3 text prompt.
-        obj = fillSa3Workflow(sa3Custom || DEFAULT_SA3_WF, prompt, dur, steps, cfg, (type === 'music') ? musicParams : null);
+        obj = fillSa3Workflow(sa3Custom || DEFAULT_SA3_WF, prompt, ep.duration, ep.steps, ep.cfg, (type === 'music') ? musicParams : null);
     } else if (engine === 'ace_step') {
         obj = fillMusicWorkflow(s.musicWorkflow || DEFAULT_MUSIC_WF, prompt, musicParams);
     } else {
         // 'stable_audio' (Stable Audio Open 1.0) — the classic ambient engine.
         obj = fillAmbientWorkflow((type === 'ambient' ? s.ambientWorkflow : s.musicWorkflow) || DEFAULT_AMBIENT_WF, prompt,
-            (type === 'ambient') ? s.ambientDuration : s.musicDuration,
-            (type === 'ambient') ? s.ambientSteps : s.musicSteps,
-            (type === 'ambient') ? s.ambientCfg : s.musicCfg);
+            ep.duration, ep.steps, ep.cfg);
     }
     if (!obj) return null;
 
@@ -776,6 +847,17 @@ function updatePresetsUI() {
     if (curVal && s.musicPresets && s.musicPresets[curVal]) sel.val(curVal);
 }
 
+// Push the active engine's saved duration/steps/cfg into the input boxes.
+function loadEngineParamsToUI(channel) {
+    var p = getEngineParams(channel);
+    if (channel === 'ambient') {
+        $('#am_amb_dur').val(p.duration); $('#am_amb_steps').val(p.steps); $('#am_amb_cfg').val(p.cfg);
+    } else {
+        $('#am_mus_dur').val(p.duration); $('#am_mus_steps').val(p.steps); $('#am_mus_cfg').val(p.cfg);
+    }
+    syncFlatParams(channel);
+}
+
 // Show/hide engine-specific controls and update the channel labels in the player.
 function syncEngineUI() {
     var s = S();
@@ -921,16 +1003,16 @@ function settingsToUI() {
     $('#am_lib_autoplay').prop('checked', s.libraryAutoplay);
     $('#am_auto_delete').prop('checked', s.autoDeleteOnChatRemove);
     $('#am_every_n').val(s.checkEveryN || 1);
-    $('#am_amb_dur').val(s.ambientDuration); $('#am_amb_steps').val(s.ambientSteps); $('#am_amb_cfg').val(s.ambientCfg);
     $('#am_amb_loop').prop('checked', s.ambientLoop); $('#am_amb_wf').val(s.ambientWorkflow || '');
     $('#am_amb_sa3_wf').val(s.ambientSa3Workflow || '');
-    $('#am_mus_dur').val(s.musicDuration); $('#am_mus_steps').val(s.musicSteps); $('#am_mus_cfg').val(s.musicCfg);
     $('#am_mus_loop').prop('checked', s.musicLoop); $('#am_mus_wf').val(s.musicWorkflow || '');
     $('#am_mus_sa3_wf').val(s.musicSa3Workflow || '');
     $('#am_mus_unet').val(s.musicUnetModel || 'acestep_v1.5_xl_sft_bf16.safetensors');
     $('#am_amb_engine').val(s.ambientEngine || 'stable_audio');
     $('#am_mus_engine').val(s.musicEngine || 'ace_step');
     $('#am_mus_sa3_ckpt').val(s.sa3CheckpointModel || 'stable_audio_3_medium.safetensors');
+    // duration/steps/cfg are pulled from the active engine's saved params
+    loadEngineParamsToUI('ambient'); loadEngineParamsToUI('music');
     $('#am_cooldown').val(s.cooldownSeconds); $('#am_context').val(s.contextMessages);
     $('#am_crossfade').val(s.crossfadeDuration); $('#am_comfy_url').val(s.comfyUrl || '');
     $('#am_start_delay').val(s.startDelay);
@@ -955,8 +1037,19 @@ function bindUI() {
     $('#am_mus_loop').on('change', function () { s.musicLoop = $(this).prop('checked'); if (state.musicAudio) state.musicAudio.loop = s.musicLoop; saveSettingsDebounced(); });
 
     var sn = function (sel, key) { $(sel).on('change', function () { s[key] = parseFloat($(this).val()) || DEFAULTS[key]; saveSettingsDebounced(); }); };
-    sn('#am_amb_dur', 'ambientDuration'); sn('#am_amb_steps', 'ambientSteps'); sn('#am_amb_cfg', 'ambientCfg');
-    sn('#am_mus_dur', 'musicDuration'); sn('#am_mus_steps', 'musicSteps'); sn('#am_mus_cfg', 'musicCfg');
+    // duration/steps/cfg are now stored per-engine: write through setEngineParam so
+    // each engine remembers its own values across switches.
+    var snEng = function (sel, channel, key) {
+        $(sel).on('change', function () {
+            var def = engineDefaults(channel, channel === 'ambient' ? s.ambientEngine : s.musicEngine)[key];
+            var val = parseFloat($(this).val());
+            if (isNaN(val)) val = def;
+            setEngineParam(channel, key, val);
+            saveSettingsDebounced();
+        });
+    };
+    snEng('#am_amb_dur', 'ambient', 'duration'); snEng('#am_amb_steps', 'ambient', 'steps'); snEng('#am_amb_cfg', 'ambient', 'cfg');
+    snEng('#am_mus_dur', 'music', 'duration'); snEng('#am_mus_steps', 'music', 'steps'); snEng('#am_mus_cfg', 'music', 'cfg');
     sn('#am_cooldown', 'cooldownSeconds'); sn('#am_context', 'contextMessages'); sn('#am_crossfade', 'crossfadeDuration'); sn('#am_start_delay', 'startDelay');
     $('#am_comfy_url').on('change', function () { s.comfyUrl = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_amb_wf').on('change', function () { s.ambientWorkflow = $(this).val().trim(); saveSettingsDebounced(); });
@@ -965,8 +1058,16 @@ function bindUI() {
     $('#am_amb_sa3_wf').on('change', function () { s.ambientSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_sa3_wf').on('change', function () { s.musicSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_sa3_ckpt').on('change', function () { s.sa3CheckpointModel = $(this).val().trim(); saveSettingsDebounced(); });
-    $('#am_amb_engine').on('change', function () { s.ambientEngine = $(this).val(); saveSettingsDebounced(); syncEngineUI(); });
-    $('#am_mus_engine').on('change', function () { s.musicEngine = $(this).val(); saveSettingsDebounced(); syncEngineUI(); });
+    // On engine change: switch the active engine, pull that engine's saved params
+    // into the flat fields + input boxes, then refresh visibility.
+    $('#am_amb_engine').on('change', function () {
+        s.ambientEngine = $(this).val(); syncFlatParams('ambient');
+        loadEngineParamsToUI('ambient'); saveSettingsDebounced(); syncEngineUI();
+    });
+    $('#am_mus_engine').on('change', function () {
+        s.musicEngine = $(this).val(); syncFlatParams('music');
+        loadEngineParamsToUI('music'); saveSettingsDebounced(); syncEngineUI();
+    });
 
     $('#am_refresh_models').on('click', async function () {
         var base = getComfyUrl().replace(/\/+$/, '');
@@ -987,7 +1088,8 @@ function bindUI() {
     $('#am_mus_preset_save').on('click', function () {
         var name = prompt('Enter preset name (saves Model, Duration, Steps, CFG):');
         if (!name) return;
-        s.musicPresets[name] = { model: s.musicUnetModel, duration: s.musicDuration, steps: s.musicSteps, cfg: s.musicCfg };
+        var mp = getEngineParams('music');
+        s.musicPresets[name] = { model: s.musicUnetModel, duration: mp.duration, steps: mp.steps, cfg: mp.cfg };
         saveSettingsDebounced(); updatePresetsUI(); $('#am_mus_preset_sel').val(name);
         toastr.success('Preset saved: ' + name, 'AutoMusic');
     });
@@ -997,11 +1099,12 @@ function bindUI() {
         if (!name || !s.musicPresets || !s.musicPresets[name]) return;
         var p = s.musicPresets[name];
         s.musicUnetModel = p.model || s.musicUnetModel;
-        s.musicDuration = p.duration || s.musicDuration;
-        s.musicSteps = p.steps || s.musicSteps;
-        s.musicCfg = p.cfg || s.musicCfg;
-        $('#am_mus_unet').val(s.musicUnetModel); $('#am_mus_dur').val(s.musicDuration);
-        $('#am_mus_steps').val(s.musicSteps); $('#am_mus_cfg').val(s.musicCfg);
+        // Write into the music channel's current-engine params so it persists across switches.
+        if (p.duration) setEngineParam('music', 'duration', p.duration);
+        if (p.steps) setEngineParam('music', 'steps', p.steps);
+        if (p.cfg) setEngineParam('music', 'cfg', p.cfg);
+        $('#am_mus_unet').val(s.musicUnetModel);
+        loadEngineParamsToUI('music');
         saveSettingsDebounced(); toastr.info('Preset loaded: ' + name, 'AutoMusic');
     });
 
@@ -1081,5 +1184,5 @@ jQuery(async function () {
     if (event_types.CHAT_DELETED) eventSource.on(event_types.CHAT_DELETED, function (data) { onChatDeleted(typeof data === 'string' ? data : (data && (data.id || data.chatId || data.chat_id))); });
     if (event_types.GROUP_DELETED) eventSource.on(event_types.GROUP_DELETED, function (data) { onGroupDeleted(typeof data === 'string' ? data : (data && (data.id || data.groupId || data.group_id))); });
 
-    console.log(L, 'v1.8.0 loaded — Stable Audio 3.0 support & per-channel engine selection');
+    console.log(L, 'v1.9.0 loaded — per-engine settings memory active');
 });
