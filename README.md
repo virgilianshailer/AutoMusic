@@ -2,7 +2,7 @@
 
 > AI-powered ambient sound & background music generation for SillyTavern, driven by ComfyUI.
 
-AutoMusic reads your chat context, asks the LLM to analyse the scene, then generates matching **ambient sounds** (via Stable Audio) and **background music** (via ACE Step) through your local ComfyUI instance — all automatically, with crossfade transitions and a persistent per-chat library.
+AutoMusic reads your chat context, asks the LLM to analyse the scene, then generates matching **ambient sounds** and **background music** through your local ComfyUI instance — all automatically, with crossfade transitions and a persistent per-chat library. Each of the two channels can be driven by the audio engine of your choice (Stable Audio Open, Stable Audio 3.0, or ACE Step).
 
 ---
 
@@ -10,9 +10,10 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
 
 - **Automatic scene analysis** — after each message (or every N messages) the LLM reads recent chat history and decides whether the ambient/music should change
 - **Dual audio streams** — separate channels for environmental ambient sounds and background music, each with independent volume, mute, and lock controls
-- **Two ComfyUI models out of the box**
-  - 🔊 **Stable Audio** — for atmospheric/environmental sounds
-  - 🎵 **ACE Step v1.5** — for full music generation with BPM, key, and time signature control
+- **Per-channel engine selection** — pick the generation engine independently for each channel
+  - 🔊 **Stable Audio Open 1.0** — lightweight atmospheric/environmental sounds
+  - 🎵 **ACE Step v1.5** — full music generation with BPM, key, and time signature control
+  - 🆕 **Stable Audio 3.0** — text-driven engine that handles *both* music and ambient/SFX; can be assigned to either channel
 - **LLM-driven music parameters** — optionally let the model pick BPM, key scale, and time signature to match the scene mood
 - **Crossfade transitions** — smooth fade between tracks when the scene changes
 - **Persistent audio library** — generated tracks are saved per-chat and survive page reloads; supports shuffle and auto-play-next
@@ -30,9 +31,12 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
 |---|---|
 | [SillyTavern](https://github.com/SillyTavern/SillyTavern) | Latest stable recommended |
 | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | Must be running and accessible |
-| **Stable Audio Open 1.0** | For ambient generation — `stable-audio-open-1.0.safetensors` |
-| **ACE Step v1.5 XL** | For music generation — `acestep_v1.5_xl_sft_bf16.safetensors` |
+| **Stable Audio Open 1.0** | For the Stable Audio Open engine — `stable-audio-open-1.0.safetensors` + `t5-base.safetensors` |
+| **Stable Audio 3.0** | For the SA3 engine — `stable_audio_3_medium.safetensors` + `t5gemma_b_b_ul2.safetensors` |
+| **ACE Step v1.5 XL** | For the ACE Step engine — `acestep_v1.5_xl_sft_bf16.safetensors` |
 | `SaveAudioMP3` ComfyUI node | Part of [ComfyUI-AudioScheduler](https://github.com/a1lazydog/ComfyUI-AudioScheduler) or similar |
+
+> You only need the model files for the engine(s) you actually assign to a channel.
 
 ---
 
@@ -58,8 +62,9 @@ git clone https://github.com/virgilianshailer/AutoMusic
 3. Expand **⚙️ Advanced Settings** and set your **ComfyUI URL** if it differs from the default
 4. Click **🧪 Test** to verify the connection — you'll see the current queue status
 5. Click **🔄** next to the UNET Model field to load available models from ComfyUI
-6. Enable the extension with the **Enabled** checkbox
-7. Start or continue a chat — music will generate automatically after the configured start delay
+6. *(Optional)* In **⚙️ Advanced Settings**, set the **Engine** for the Ambient and Music channels — to use Stable Audio 3.0 for either channel, pick it from that channel's Engine dropdown
+7. Enable the extension with the **Enabled** checkbox
+8. Start or continue a chat — music will generate automatically after the configured start delay
 
 ---
 
@@ -81,26 +86,31 @@ git clone https://github.com/virgilianshailer/AutoMusic
 | **Auto-delete tracks on chat removal** | Delete saved audio files when the chat/group is deleted |
 | **Analyze every N message(s)** | Check for scene changes only every N messages (reduces LLM calls) |
 
-### Ambient (Stable Audio)
+### Ambient channel
 
 | Setting | Default | Description |
 |---|---|---|
+| Engine | Stable Audio Open 1.0 | Generation engine for this channel (Stable Audio Open / Stable Audio 3.0 / ACE Step) |
 | Duration | 60 s | Length of generated ambient clip |
 | Steps | 50 | Sampler steps (quality vs speed) |
 | CFG | 5 | Classifier-free guidance scale |
 | Loop | ✓ | Loop the clip continuously |
-| Custom workflow JSON | — | Override the built-in workflow |
+| Custom workflow JSON | — | Override the built-in workflow (a separate box appears for the SA3 engine) |
 
-### Music (ACE Step)
+### Music channel
 
 | Setting | Default | Description |
 |---|---|---|
+| Engine | ACE Step v1.5 | Generation engine for this channel (ACE Step / Stable Audio 3.0 / Stable Audio Open) |
 | Duration | 120 s | Length of generated music clip |
 | Steps | 8 | Sampler steps |
 | CFG | 1 | Guidance scale |
-| UNET Model | `acestep_v1.5_xl_sft_bf16.safetensors` | Model file name |
+| UNET Model | `acestep_v1.5_xl_sft_bf16.safetensors` | Model file name *(ACE Step engine only)* |
+| SA3 Checkpoint | `stable_audio_3_medium.safetensors` | Checkpoint file name *(Stable Audio 3.0 engine only)* |
 | Loop | ✓ | Loop the clip continuously |
-| Custom workflow JSON | — | Override the built-in workflow; must contain `%unet_name%` |
+| Custom workflow JSON | — | Override the built-in workflow (ACE Step box must contain `%unet_name%`; SA3 box uses `%sa3_ckpt%`) |
+
+> **Note on engines:** ACE Step consumes BPM / key / time signature as structured inputs. Stable Audio Open and Stable Audio 3.0 are purely text-driven — when one of them is the music engine, the LLM is not asked for those parameters, and any that exist are gently folded into the text prompt instead (e.g. `… BPM: 72. Key: A minor.`).
 
 ### General / Timing
 
@@ -130,7 +140,8 @@ When writing a custom workflow JSON, use these placeholders — they are replace
 | `%keyscale%` | Key and scale, e.g. `A minor` *(music only)* |
 | `%timesignature%` | Time signature numerator: `2`, `3`, `4`, or `6` *(music only)* |
 | `%lyrics%` | Lyrics string — always empty, reserved for future use *(music only)* |
-| `%unet_name%` | UNET model filename *(music only — required in custom music workflows)* |
+| `%unet_name%` | UNET model filename *(ACE Step music only — required in custom ACE Step workflows)* |
+| `%sa3_ckpt%` | Stable Audio 3.0 checkpoint filename *(SA3 workflows only)* |
 
 ---
 
@@ -187,6 +198,10 @@ Generation requests are serialised through an internal queue — only one ComfyU
 **"No UNETLoader info found" after clicking 🔄**
 - Make sure the ACE Step custom nodes are installed in ComfyUI (`TextEncodeAceStepAudio1.5`, `EmptyAceStep1.5LatentAudio`, `UNETLoader`)
 
+**Stable Audio 3.0 engine produces nothing / errors**
+- Confirm `stable_audio_3_medium.safetensors` and the CLIP file `t5gemma_b_b_ul2.safetensors` are present in ComfyUI and that the names match your **SA3 Checkpoint** setting
+- SA3 is text-only — BPM/key/time-signature controls are intentionally hidden when SA3 is the music engine; describe tempo and mood directly in the scene text instead
+
 **Music generates but sounds wrong**
 - Try enabling **LLM picks BPM / key / time sig** for more contextually appropriate parameters
 - Increase **Steps** (try 20–30) for higher quality at the cost of generation time
@@ -203,6 +218,7 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.8.0 | Stable Audio 3.0 engine, per-channel engine selection (assign any engine to ambient or music) |
 | 1.7.0 | UNET model selector UI, model list fetcher from ComfyUI, music presets |
 | 1.6.0 | Per-chat audio library, auto-delete on chat removal, shuffle & auto-play |
 | 1.5.x | ACE Step v1.5 support, LLM music parameter selection |
