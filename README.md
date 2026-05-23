@@ -14,6 +14,7 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
   - 🔊 **Stable Audio Open 1.0** — lightweight atmospheric/environmental sounds
   - 🎵 **ACE Step v1.5** — full music generation with BPM, key, and time signature control
   - 🆕 **Stable Audio 3.0** — text-driven engine that handles *both* music and ambient/SFX; can be assigned to either channel
+- **Per-engine settings memory** — duration, steps, and CFG are remembered separately for each engine on each channel, so switching engines restores that engine's own optimal settings instead of overwriting them
 - **LLM-driven music parameters** — optionally let the model pick BPM, key scale, and time signature to match the scene mood
 - **Crossfade transitions** — smooth fade between tracks when the scene changes
 - **Persistent audio library** — generated tracks are saved per-chat and survive page reloads; supports shuffle and auto-play-next
@@ -111,6 +112,8 @@ git clone https://github.com/virgilianshailer/AutoMusic
 | Custom workflow JSON | — | Override the built-in workflow (ACE Step box must contain `%unet_name%`; SA3 box uses `%sa3_ckpt%`) |
 
 > **Note on engines:** ACE Step consumes BPM / key / time signature as structured inputs. Stable Audio Open and Stable Audio 3.0 are purely text-driven — when one of them is the music engine, the LLM is not asked for those parameters, and any that exist are gently folded into the text prompt instead (e.g. `… BPM: 72. Key: A minor.`).
+>
+> **Settings are remembered per engine.** Duration / Steps / CFG are stored separately for each engine on each channel. When you switch an engine, its own saved values (or its recommended defaults the first time) are loaded — so e.g. Stable Audio Open 1.0 keeps 50 steps / CFG 5 while Stable Audio 3.0 keeps 8 steps / CFG 1, and tweaking one never disturbs the other.
 
 ### General / Timing
 
@@ -218,6 +221,7 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.9.0 | Per-engine settings memory — duration/steps/CFG stored separately for each engine on each channel |
 | 1.8.0 | Stable Audio 3.0 engine, per-channel engine selection (assign any engine to ambient or music) |
 | 1.7.0 | UNET model selector UI, model list fetcher from ComfyUI, music presets |
 | 1.6.0 | Per-chat audio library, auto-delete on chat removal, shuffle & auto-play |
