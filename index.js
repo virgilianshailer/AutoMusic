@@ -1,5 +1,5 @@
 /**
- * AutoMusic v1.7.0 — UNET Model selection, ComfyUI model fetcher, Music Presets
+ * AutoMusic v1.8.0 — Stable Audio 3.0 support, per-channel engine selection
  */
 import {
     eventSource, event_types, getRequestHeaders,
@@ -19,6 +19,17 @@ var KEYSCALES = [
 ];
 var TIME_SIGS = ['2','3','4','6'];
 
+/* ============ AUDIO ENGINES ============ */
+// Each channel (ambient / music) can be driven by one of these engines.
+// 'stable_audio'    — Stable Audio Open 1.0  (text prompt, no music theory params)
+// 'ace_step'        — ACE Step v1.5          (full music: bpm / keyscale / timesig / unet)
+// 'stable_audio_3'  — Stable Audio 3.0       (text prompt, can do music & SFX/ambient)
+var ENGINES = {
+    stable_audio:   { label: 'Stable Audio Open 1.0', musicParams: false },
+    ace_step:       { label: 'ACE Step v1.5',         musicParams: true  },
+    stable_audio_3: { label: 'Stable Audio 3.0',      musicParams: false },
+};
+
 /* ============ DEFAULTS ============ */
 var DEFAULTS = {
     enabled: false,
@@ -33,6 +44,12 @@ var DEFAULTS = {
     comfyUrl: '',
     ambientWorkflow: '',
     musicWorkflow: '',
+    // v1.8: per-channel engine selection + Stable Audio 3.0 workflows
+    ambientEngine: 'stable_audio',
+    musicEngine: 'ace_step',
+    ambientSa3Workflow: '',
+    musicSa3Workflow: '',
+    sa3CheckpointModel: 'stable_audio_3_medium.safetensors',
     musicUnetModel: 'acestep_v1.5_xl_sft_bf16.safetensors',
     musicPresets: {},
     ambientDuration: 60,
@@ -92,6 +109,12 @@ function loadSettings() {
             s.musicWorkflow = s.musicWorkflow.replace('"acestep_v1.5_xl_sft_bf16.safetensors"', '"%unet_name%"');
         }
         s._migrated_v17_unet = true;
+    }
+    // v1.8: existing chats keep their classic engines (ambient=Stable Audio, music=ACE Step)
+    if (!s._migrated_v18_engine) {
+        if (!s.ambientEngine) s.ambientEngine = 'stable_audio';
+        if (!s.musicEngine) s.musicEngine = 'ace_step';
+        s._migrated_v18_engine = true;
     }
 
     if (!s.savedTracks) s.savedTracks = {};
@@ -313,8 +336,28 @@ var DEFAULT_MUSIC_WF = JSON.stringify({
     "107": { "inputs": { "filename_prefix": "audio/AutoMusic_mus", "quality": "V0", "audio": ["18", 0] }, "class_type": "SaveAudioMP3" }
 });
 
+// Stable Audio 3.0 — usable for BOTH ambient sounds and background music.
+// Cleaned from the SwarmUI export: SwarmUI-only helper nodes (TextGenerate
+// reprompt, CustomCombo, JsonExtractString, Math, Switch, PreviewAny) removed,
+// since SillyTavern's own LLM already produces the final prompt.
+var DEFAULT_SA3_WF = JSON.stringify({
+    "57": { "inputs": { "text": "%negative_prompt%", "clip": ["76", 0] }, "class_type": "CLIPTextEncode" },
+    "62": { "inputs": { "text": "%prompt%", "clip": ["76", 0] }, "class_type": "CLIPTextEncode" },
+    "59": { "inputs": { "seconds": "%duration%", "batch_size": 1 }, "class_type": "EmptyLatentAudio" },
+    "60": { "inputs": { "seed": "%seed%", "steps": "%steps%", "cfg": "%cfg%", "sampler_name": "lcm", "scheduler": "simple", "denoise": 1, "model": ["75", 0], "positive": ["62", 0], "negative": ["57", 0], "latent_image": ["59", 0] }, "class_type": "KSampler" },
+    "58": { "inputs": { "samples": ["60", 0], "vae": ["75", 2] }, "class_type": "VAEDecodeAudio" },
+    "75": { "inputs": { "ckpt_name": "%sa3_ckpt%" }, "class_type": "CheckpointLoaderSimple" },
+    "76": { "inputs": { "clip_name": "t5gemma_b_b_ul2.safetensors", "type": "stable_audio", "device": "default" }, "class_type": "CLIPLoader" },
+    "19": { "inputs": { "filename_prefix": "audio/AutoMusic_sa3", "quality": "V0", "audio": ["58", 0] }, "class_type": "SaveAudioMP3" }
+});
+
 /* ============ LLM ============ */
 function buildAudioPrompt(text, llmParams) {
+    var s = S();
+    var ambEng = s.ambientEngine || 'stable_audio';
+    var musEng = s.musicEngine || 'ace_step';
+    var ambModelName = (ambEng === 'stable_audio_3') ? 'Stable Audio 3.0' : 'Stable Audio';
+    var musModelName = (musEng === 'stable_audio_3') ? 'Stable Audio 3.0' : (musEng === 'stable_audio' ? 'Stable Audio' : 'ACE Step');
     var musicExtra = '';
     if (llmParams) {
         musicExtra = '\n\nMUSIC PARAMS: Also determine:\n' +
@@ -326,9 +369,9 @@ function buildAudioPrompt(text, llmParams) {
     var forceNote = (noAmb || noMus) ? '\nIMPORTANT: Current ' + (noAmb && noMus ? 'ambient and music are' : noAmb ? 'ambient is' : 'music is') + ' empty — you MUST set changed:true and provide a prompt.\n' : '\nOnly change if atmosphere SIGNIFICANTLY shifted.\n';
     
     return 'You analyze narrative text and generate audio cues: ambient sounds and background music.\n\n' +
-        'AMBIENT: environmental/atmospheric sounds only — NOT music. For Stable Audio model.\n' +
+        'AMBIENT: environmental/atmospheric sounds only — NOT music. For the ' + ambModelName + ' model.\n' +
         'Examples: "rain on windows, distant thunder, cozy fireplace crackling", "busy city street, car horns, crowd chatter"\n\n' +
-        'MUSIC: Detailed narrative description for the ACE Step music generation model.\n' +
+        'MUSIC: Detailed narrative description for the ' + musModelName + ' music generation model.\n' +
         'Instead of simple tags, write a rich, descriptive paragraph (3-5 sentences) detailing the track. Include:\n' +
         '  1. GENRE & VIBE: (e.g., "A quiet, meditative ambient electronic track...")\n' +
         '  2. INSTRUMENTS & TEXTURES: Be specific (e.g., "slowly evolving pad textures," "fingerpicked acoustic guitar," "faint crackle of vinyl").\n' +
@@ -350,8 +393,16 @@ function buildAudioPrompt(text, llmParams) {
         '--- TEXT ---\n' + text + '\n--- END ---';
 }
 
+// Music theory params (bpm/key/timesig) only make sense for engines that consume
+// them as structured inputs. SA3 is text-only, so don't bother the LLM for them.
+function musicEngineUsesParams() {
+    var eng = ENGINES[S().musicEngine || 'ace_step'];
+    return eng ? eng.musicParams : true;
+}
+
 async function analyseAudio(text) {
-    var prompt = buildAudioPrompt(text, S().llmMusicParams), raw = null;
+    var wantParams = S().llmMusicParams && musicEngineUsesParams();
+    var prompt = buildAudioPrompt(text, wantParams), raw = null;
     try { raw = await generateQuietPrompt(prompt, false, false); } catch (e1) { try { raw = await generateQuietPrompt(prompt, false, true); } catch (e2) { return null; } }
     if (!raw) return null;
     var c = raw.replace(/```(?:json)?\s*/gi, '').replace(/```/g, ''), f = c.indexOf('{'), l = c.lastIndexOf('}');
@@ -367,6 +418,32 @@ function fillAmbientWorkflow(wfStr, prompt, duration, steps, cfg) {
     for (var key in strMap) t = t.split(key).join(strMap[key]);
     for (var key in numMap) { var v = String(numMap[key]); t = t.split('"' + key + '"').join(v); t = t.split(key).join(v); }
     try { return JSON.parse(t); } catch (e) { console.error(L, 'Ambient WF error:', e.message); return null; }
+}
+
+// Stable Audio 3.0 fill — works for either channel. SA3 is purely text-driven,
+// so any music params (bpm/keyscale) are softly appended to the prompt text
+// rather than mapped to dedicated workflow inputs.
+function fillSa3Workflow(wfStr, prompt, duration, steps, cfg, musicParams) {
+    var t = wfStr, s = S();
+    var finalPrompt = prompt || '';
+    if (musicParams) {
+        var extras = [];
+        if (musicParams.bpm) extras.push('BPM: ' + musicParams.bpm);
+        if (musicParams.keyscale) extras.push('Key: ' + musicParams.keyscale);
+        if (extras.length) finalPrompt = finalPrompt.replace(/\s*$/, '') + '. ' + extras.join('. ') + '.';
+    }
+    // SA3 reads target length from the prompt too — append it if not already present.
+    if (duration && !/length\s*:/i.test(finalPrompt)) {
+        finalPrompt = finalPrompt.replace(/\s*$/, '') + ' Length: ' + Math.round(duration) + ' seconds.';
+    }
+    var strMap = {
+        '%prompt%': escJ(finalPrompt), '%negative_prompt%': '',
+        '%sa3_ckpt%': escJ(s.sa3CheckpointModel || 'stable_audio_3_medium.safetensors')
+    };
+    var numMap = { '%seed%': Math.floor(Math.random() * 2147483647), '%steps%': steps || 8, '%cfg%': cfg || 1, '%duration%': duration || 60, '%denoise%': 1 };
+    for (var key in strMap) t = t.split(key).join(strMap[key]);
+    for (var key in numMap) { var v = String(numMap[key]); t = t.split('"' + key + '"').join(v); t = t.split(key).join(v); }
+    try { return JSON.parse(t); } catch (e) { console.error(L, 'SA3 WF error:', e.message); return null; }
 }
 
 function fillMusicWorkflow(wfStr, prompt, musicParams) {
@@ -396,8 +473,25 @@ async function generateAudioQueued(type, prompt, musicParams) {
 
 async function generateAudioDirect(type, prompt, musicParams) {
     var s = S(), base = getComfyUrl().replace(/\/+$/, ''), obj;
-    if (type === 'ambient') obj = fillAmbientWorkflow(s.ambientWorkflow || DEFAULT_AMBIENT_WF, prompt, s.ambientDuration, s.ambientSteps, s.ambientCfg);
-    else obj = fillMusicWorkflow(s.musicWorkflow || DEFAULT_MUSIC_WF, prompt, musicParams);
+    var engine = (type === 'ambient') ? (s.ambientEngine || 'stable_audio') : (s.musicEngine || 'ace_step');
+
+    if (engine === 'stable_audio_3') {
+        // Per-channel custom SA3 workflow overrides the built-in default.
+        var sa3Custom = (type === 'ambient') ? s.ambientSa3Workflow : s.musicSa3Workflow;
+        var dur = (type === 'ambient') ? s.ambientDuration : s.musicDuration;
+        var steps = (type === 'ambient') ? s.ambientSteps : s.musicSteps;
+        var cfg = (type === 'ambient') ? s.ambientCfg : s.musicCfg;
+        // Music channel may carry bpm/keyscale to fold into the SA3 text prompt.
+        obj = fillSa3Workflow(sa3Custom || DEFAULT_SA3_WF, prompt, dur, steps, cfg, (type === 'music') ? musicParams : null);
+    } else if (engine === 'ace_step') {
+        obj = fillMusicWorkflow(s.musicWorkflow || DEFAULT_MUSIC_WF, prompt, musicParams);
+    } else {
+        // 'stable_audio' (Stable Audio Open 1.0) — the classic ambient engine.
+        obj = fillAmbientWorkflow((type === 'ambient' ? s.ambientWorkflow : s.musicWorkflow) || DEFAULT_AMBIENT_WF, prompt,
+            (type === 'ambient') ? s.ambientDuration : s.musicDuration,
+            (type === 'ambient') ? s.ambientSteps : s.musicSteps,
+            (type === 'ambient') ? s.ambientCfg : s.musicCfg);
+    }
     if (!obj) return null;
 
     updateStatus('gen-' + type);
@@ -682,6 +776,29 @@ function updatePresetsUI() {
     if (curVal && s.musicPresets && s.musicPresets[curVal]) sel.val(curVal);
 }
 
+// Show/hide engine-specific controls and update the channel labels in the player.
+function syncEngineUI() {
+    var s = S();
+    var ambEng = s.ambientEngine || 'stable_audio';
+    var musEng = s.musicEngine || 'ace_step';
+
+    // Player section labels reflect the chosen engine.
+    $('#am_amb_engine_lbl').text('(' + (ENGINES[ambEng] ? ENGINES[ambEng].label : ambEng) + ')');
+    $('#am_mus_engine_lbl').text('(' + (ENGINES[musEng] ? ENGINES[musEng].label : musEng) + ')');
+
+    // Ambient: SA3 workflow box only relevant when SA3 is the ambient engine;
+    // the classic Stable Audio Open box otherwise.
+    $('#am_amb_sa3_wf').toggle(ambEng === 'stable_audio_3');
+    $('#am_amb_wf').toggle(ambEng !== 'stable_audio_3');
+
+    // Music: swap between ACE Step controls and SA3 controls.
+    var musIsSa3 = (musEng === 'stable_audio_3');
+    $('#am_mus_ace_block').toggle(musEng === 'ace_step');
+    $('#am_mus_sa3_block').toggle(musIsSa3);
+    $('#am_mus_sa3_wf').toggle(musIsSa3);
+    $('#am_mus_wf').toggle(musEng === 'ace_step');
+}
+
 /* ============ SETTINGS HTML ============ */
 function buildUI() {
     return '<div id="auto_music_settings"><div class="inline-drawer">' +
@@ -690,8 +807,8 @@ function buildUI() {
         '<div class="inline-drawer-content">' +
 
         '<label class="checkbox_label"><input id="am_on" type="checkbox"/><span>Enabled</span></label>' +
-        '<label class="checkbox_label"><input id="am_ambient_on" type="checkbox"/><span>Ambient sounds (Stable Audio)</span></label>' +
-        '<label class="checkbox_label"><input id="am_music_on" type="checkbox"/><span>Background music (ACE Step)</span></label>' +
+        '<label class="checkbox_label"><input id="am_ambient_on" type="checkbox"/><span>Ambient sounds</span></label>' +
+        '<label class="checkbox_label"><input id="am_music_on" type="checkbox"/><span>Background music</span></label>' +
         '<label class="checkbox_label"><input id="am_gen_start" type="checkbox"/><span>Generate on chat start</span></label>' +
         '<label class="checkbox_label"><input id="am_llm_params" type="checkbox"/><span>LLM picks BPM / key / time sig</span></label>' +
         '<label class="checkbox_label"><input id="am_show_gal" type="checkbox"/><span>Session gallery</span></label>' +
@@ -708,14 +825,14 @@ function buildUI() {
         '<div style="display:flex;align-items:center;gap:6px;margin:6px 0">' +
         '<div id="am_status_dot" class="am-dot"></div><span id="am_status_text" style="font-size:.82em;color:#888">Idle</span></div>' +
 
-        '<div class="am-section-label">Music <small style="color:#666">(ACE Step)</small></div>' +
+        '<div class="am-section-label">Music <small id="am_mus_engine_lbl" style="color:#666">(ACE Step)</small></div>' +
         '<div class="am-track-row">' +
         '<button id="am_mute_mus" class="am-btn-sm" title="Mute">🎵</button>' +
         '<input id="am_vol_mus" type="range" class="am-vol" min="0" max="1" step="0.05" value="0.3"/>' +
         '<span id="am_mus_name" class="am-track-name" title="">—</span>' +
         '<button id="am_lock_mus" class="am-btn-sm am-lock-btn" title="Lock">🔓</button></div>' +
 
-        '<div class="am-section-label">Ambient <small style="color:#666">(Stable Audio)</small></div>' +
+        '<div class="am-section-label">Ambient <small id="am_amb_engine_lbl" style="color:#666">(Stable Audio)</small></div>' +
         '<div class="am-track-row">' +
         '<button id="am_mute_amb" class="am-btn-sm" title="Mute">🔊</button>' +
         '<input id="am_vol_amb" type="range" class="am-vol" min="0" max="1" step="0.05" value="0.5"/>' +
@@ -736,15 +853,27 @@ function buildUI() {
 
         '<details class="am-details"><summary style="cursor:pointer;font-size:.82em;color:#aaa">⚙️ Advanced Settings</summary>' +
 
-        '<div class="am-sg"><label style="font-size:.8em"><b>🔊 Ambient (Stable Audio)</b></label>' +
+        '<div class="am-sg"><label style="font-size:.8em"><b>🔊 Ambient</b></label>' +
+        '<div style="margin-bottom:4px"><label style="font-size:.75em">Engine:</label>' +
+        '<select id="am_amb_engine" class="text_pole" style="font-size:.82em">' +
+        '<option value="stable_audio">Stable Audio Open 1.0</option>' +
+        '<option value="stable_audio_3">Stable Audio 3.0</option>' +
+        '<option value="ace_step">ACE Step v1.5</option></select></div>' +
         '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
         '<div style="flex:1"><label style="font-size:.75em">Duration (s):</label><input id="am_amb_dur" type="number" class="text_pole" style="font-size:.82em"/></div>' +
         '<div style="flex:1"><label style="font-size:.75em">Steps:</label><input id="am_amb_steps" type="number" class="text_pole" style="font-size:.82em"/></div>' +
         '<div style="flex:1"><label style="font-size:.75em">CFG:</label><input id="am_amb_cfg" type="number" step="0.5" class="text_pole" style="font-size:.82em"/></div></div>' +
         '<label class="checkbox_label"><input id="am_amb_loop" type="checkbox"/><span style="font-size:.82em">Loop</span></label>' +
-        '<textarea id="am_amb_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom Stable Audio workflow JSON"></textarea></div>' +
+        '<textarea id="am_amb_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom Stable Audio Open workflow JSON"></textarea>' +
+        '<textarea id="am_amb_sa3_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom Stable Audio 3.0 workflow JSON (uses %sa3_ckpt%)"></textarea></div>' +
 
-        '<div class="am-sg"><label style="font-size:.8em"><b>🎵 Music (ACE Step)</b></label>' +
+        '<div class="am-sg"><label style="font-size:.8em"><b>🎵 Music</b></label>' +
+        '<div style="margin-bottom:6px"><label style="font-size:.75em">Engine:</label>' +
+        '<select id="am_mus_engine" class="text_pole" style="font-size:.82em">' +
+        '<option value="ace_step">ACE Step v1.5</option>' +
+        '<option value="stable_audio_3">Stable Audio 3.0</option>' +
+        '<option value="stable_audio">Stable Audio Open 1.0</option></select></div>' +
+        '<div id="am_mus_ace_block">' +
         '<div style="display:flex;gap:4px;align-items:center;margin-bottom:6px;background:rgba(255,255,255,.03);padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.05);">' +
         '<span style="font-size:.75em;color:#aaa">Presets:</span>' +
         '<select id="am_mus_preset_sel" class="text_pole" style="font-size:.82em;flex:1;padding:2px"><option value="">-- Select --</option></select>' +
@@ -754,13 +883,16 @@ function buildUI() {
         '<div style="display:flex;gap:4px;margin-bottom:6px;">' +
         '<div style="flex:1"><label style="font-size:.75em">UNET Model:</label><input id="am_mus_unet" list="am_unet_list" class="text_pole" style="font-size:.82em" placeholder="acestep_...safetensors"/></div>' +
         '<div style="display:flex;align-items:flex-end;"><div id="am_refresh_models" class="menu_button" style="font-size:.82em;padding:5px 8px;" title="Fetch models from ComfyUI">🔄</div></div>' +
-        '<datalist id="am_unet_list"></datalist></div>' +
+        '<datalist id="am_unet_list"></datalist></div></div>' +
+        '<div id="am_mus_sa3_block" style="display:none;margin-bottom:6px;">' +
+        '<label style="font-size:.75em">SA3 Checkpoint:</label><input id="am_mus_sa3_ckpt" class="text_pole" style="font-size:.82em" placeholder="stable_audio_3_medium.safetensors"/></div>' +
         '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
         '<div style="flex:1"><label style="font-size:.75em">Duration (s):</label><input id="am_mus_dur" type="number" class="text_pole" style="font-size:.82em"/></div>' +
         '<div style="flex:1"><label style="font-size:.75em">Steps:</label><input id="am_mus_steps" type="number" class="text_pole" style="font-size:.82em"/></div>' +
         '<div style="flex:1"><label style="font-size:.75em">CFG:</label><input id="am_mus_cfg" type="number" step="0.5" class="text_pole" style="font-size:.82em"/></div></div>' +
         '<label class="checkbox_label"><input id="am_mus_loop" type="checkbox"/><span style="font-size:.82em">Loop</span></label>' +
-        '<textarea id="am_mus_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom ACE Step workflow JSON (must use %unet_name%)"></textarea></div>' +
+        '<textarea id="am_mus_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom ACE Step workflow JSON (must use %unet_name%)"></textarea>' +
+        '<textarea id="am_mus_sa3_wf" class="text_pole" rows="2" style="font-size:.78em;margin-top:2px" placeholder="Custom Stable Audio 3.0 workflow JSON (uses %sa3_ckpt%)"></textarea></div>' +
 
         '<div class="am-sg"><label style="font-size:.8em"><b>⚙️ General</b></label>' +
         '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
@@ -791,14 +923,19 @@ function settingsToUI() {
     $('#am_every_n').val(s.checkEveryN || 1);
     $('#am_amb_dur').val(s.ambientDuration); $('#am_amb_steps').val(s.ambientSteps); $('#am_amb_cfg').val(s.ambientCfg);
     $('#am_amb_loop').prop('checked', s.ambientLoop); $('#am_amb_wf').val(s.ambientWorkflow || '');
+    $('#am_amb_sa3_wf').val(s.ambientSa3Workflow || '');
     $('#am_mus_dur').val(s.musicDuration); $('#am_mus_steps').val(s.musicSteps); $('#am_mus_cfg').val(s.musicCfg);
     $('#am_mus_loop').prop('checked', s.musicLoop); $('#am_mus_wf').val(s.musicWorkflow || '');
+    $('#am_mus_sa3_wf').val(s.musicSa3Workflow || '');
     $('#am_mus_unet').val(s.musicUnetModel || 'acestep_v1.5_xl_sft_bf16.safetensors');
+    $('#am_amb_engine').val(s.ambientEngine || 'stable_audio');
+    $('#am_mus_engine').val(s.musicEngine || 'ace_step');
+    $('#am_mus_sa3_ckpt').val(s.sa3CheckpointModel || 'stable_audio_3_medium.safetensors');
     $('#am_cooldown').val(s.cooldownSeconds); $('#am_context').val(s.contextMessages);
     $('#am_crossfade').val(s.crossfadeDuration); $('#am_comfy_url').val(s.comfyUrl || '');
     $('#am_start_delay').val(s.startDelay);
     $('[data-gal]').toggle(s.showGallery);
-    syncPlayerUI(); updateGalleryBadge(); updateLibraryUI(); updatePresetsUI();
+    syncPlayerUI(); updateGalleryBadge(); updateLibraryUI(); updatePresetsUI(); syncEngineUI();
 }
 
 function bindUI() {
@@ -825,6 +962,11 @@ function bindUI() {
     $('#am_amb_wf').on('change', function () { s.ambientWorkflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_wf').on('change', function () { s.musicWorkflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_unet').on('change', function () { s.musicUnetModel = $(this).val().trim(); saveSettingsDebounced(); });
+    $('#am_amb_sa3_wf').on('change', function () { s.ambientSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
+    $('#am_mus_sa3_wf').on('change', function () { s.musicSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
+    $('#am_mus_sa3_ckpt').on('change', function () { s.sa3CheckpointModel = $(this).val().trim(); saveSettingsDebounced(); });
+    $('#am_amb_engine').on('change', function () { s.ambientEngine = $(this).val(); saveSettingsDebounced(); syncEngineUI(); });
+    $('#am_mus_engine').on('change', function () { s.musicEngine = $(this).val(); saveSettingsDebounced(); syncEngineUI(); });
 
     $('#am_refresh_models').on('click', async function () {
         var base = getComfyUrl().replace(/\/+$/, '');
@@ -939,5 +1081,5 @@ jQuery(async function () {
     if (event_types.CHAT_DELETED) eventSource.on(event_types.CHAT_DELETED, function (data) { onChatDeleted(typeof data === 'string' ? data : (data && (data.id || data.chatId || data.chat_id))); });
     if (event_types.GROUP_DELETED) eventSource.on(event_types.GROUP_DELETED, function (data) { onGroupDeleted(typeof data === 'string' ? data : (data && (data.id || data.groupId || data.group_id))); });
 
-    console.log(L, 'v1.7.0 loaded — UI model fetcher & music presets active');
+    console.log(L, 'v1.8.0 loaded — Stable Audio 3.0 support & per-channel engine selection');
 });
