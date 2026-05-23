@@ -16,7 +16,7 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
   - 🆕 **Stable Audio 3.0** — text-driven engine that handles *both* music and ambient/SFX; can be assigned to either channel
 - **Per-engine settings memory** — duration, steps, and CFG are remembered separately for each engine on each channel, so switching engines restores that engine's own optimal settings instead of overwriting them
 - **LLM-driven music parameters** — optionally let the model pick BPM, key scale, and time signature to match the scene mood
-- **Crossfade transitions** — smooth fade between tracks when the scene changes
+- **Crossfade transitions** — smooth overlapping fade between tracks both when the scene changes and when the library auto-plays the next track (the next clip starts a few seconds early so it blends in instead of cutting off)
 - **Persistent audio library** — generated tracks are saved per-chat and survive page reloads; supports shuffle and auto-play-next
 - **Session gallery** — quick in-session overview of everything generated this session with playback and download
 - **Music presets** — save/load UNET model + generation parameter sets for fast switching
@@ -121,7 +121,7 @@ git clone https://github.com/virgilianshailer/AutoMusic
 |---|---|---|
 | Cooldown | 60 s | Minimum time between automatic generation triggers |
 | Context messages | 5 | How many recent messages to send to the LLM for analysis |
-| Crossfade | 3 s | Fade duration when switching tracks |
+| Crossfade | 3 s | Overlap/fade duration when switching tracks and when auto-playing the next library track (set to 0 to disable and switch instantly on track end) |
 | ComfyUI URL | `http://127.0.0.1:8188` | Address of your ComfyUI instance |
 | Start delay | 8 s | How long to wait after opening a chat before first generation |
 
@@ -221,6 +221,7 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.9.1 | Fixed crossfade: tracks now overlap smoothly at end-of-track autoplay instead of cutting off abruptly; more reliable playback start |
 | 1.9.0 | Per-engine settings memory — duration/steps/CFG stored separately for each engine on each channel |
 | 1.8.0 | Stable Audio 3.0 engine, per-channel engine selection (assign any engine to ambient or music) |
 | 1.7.0 | UNET model selector UI, model list fetcher from ComfyUI, music presets |
