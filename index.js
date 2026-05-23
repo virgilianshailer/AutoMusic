@@ -1,5 +1,5 @@
 /**
- * AutoMusic v1.9.0 — per-engine settings memory
+ * AutoMusic v1.9.1 — per-engine settings memory, fixed crossfade on track change
  */
 import {
     eventSource, event_types, getRequestHeaders,
@@ -601,17 +601,56 @@ async function generateAudioDirect(type, prompt, musicParams) {
 }
 
 /* ============ AUDIO PLAYBACK ============ */
+// Smoothly fade `oldAudio` out while fading `newAudio` in. Returns immediately
+// if there's nothing to fade. Guarded against being run twice on the same pair.
 function crossfade(oldAudio, newAudio, duration, targetVol) {
     if (!newAudio) return;
-    newAudio.volume = 0; newAudio.play().catch(function () {});
-    var steps = 30, interval = (duration * 1000) / steps, step = 0;
-    var oldVol = oldAudio ? oldAudio.volume : 0;
+    if (newAudio._fading) return;            // already mid-fade, don't stack timers
+    newAudio._fading = true;
+    newAudio.volume = 0;
+    newAudio.play().catch(function () {});
+    var dur = (duration && duration > 0) ? duration : 0.01;
+    var steps = 30, interval = (dur * 1000) / steps, step = 0;
+    var oldVol = (oldAudio && !oldAudio.paused) ? oldAudio.volume : 0;
     var fade = setInterval(function () {
         step++; var p = step / steps;
         newAudio.volume = Math.min(p * targetVol, targetVol);
-        if (oldAudio) { oldAudio.volume = Math.max((1 - p) * oldVol, 0); if (oldAudio.volume <= 0.01) { oldAudio._stopping = true; oldAudio.pause(); oldAudio.removeAttribute('src'); oldAudio.load(); } }
-        if (step >= steps) { clearInterval(fade); newAudio.volume = targetVol; }
+        if (oldAudio) {
+            oldAudio.volume = Math.max((1 - p) * oldVol, 0);
+            if (oldAudio.volume <= 0.01 && !oldAudio.paused) {
+                oldAudio._stopping = true; oldAudio.pause();
+                oldAudio.removeAttribute('src'); oldAudio.load();
+            }
+        }
+        if (step >= steps) {
+            clearInterval(fade);
+            newAudio.volume = targetVol;
+            newAudio._fading = false;
+            if (oldAudio && !oldAudio.paused) { oldAudio._stopping = true; oldAudio.pause(); oldAudio.removeAttribute('src'); oldAudio.load(); }
+        }
     }, interval);
+}
+
+// Schedule an overlapping crossfade into the next library track for a NON-looping
+// clip: when playback reaches (duration - crossfade) seconds, start the next one
+// while the current is still audible. This is what produces an actual crossfade
+// at end-of-track instead of an abrupt stop.
+function attachAutoCrossfade(type, audio) {
+    audio.addEventListener('timeupdate', function onTU() {
+        var s = S();
+        if (audio.loop) return;                                  // looping clips never end
+        if (!(s.libraryEnabled && s.libraryAutoplay)) return;    // autoplay-next disabled
+        if (audio._nextScheduled) return;                        // already kicked off
+        var cf = (s.crossfadeDuration && s.crossfadeDuration > 0) ? s.crossfadeDuration : 0;
+        var dur = audio.duration;
+        if (!isFinite(dur) || dur <= 0) return;
+        // Begin the next track `cf` seconds before this one ends (min 0.05s guard).
+        if (cf > 0 && audio.currentTime >= dur - cf - 0.05) {
+            audio._nextScheduled = true;
+            audio.removeEventListener('timeupdate', onTU);
+            playNextFromLibrary(type);
+        }
+    });
 }
 
 function playAudio(type, url) {
@@ -622,18 +661,34 @@ function playAudio(type, url) {
     var audio = new Audio(url);
     audio.loop = loop; audio.preload = 'auto';
 
-    audio.addEventListener('canplaythrough', function () {
+    var started = false;
+    var start = function () {
+        if (started) return; started = true;
         if (oldAudio && !oldAudio.paused) crossfade(oldAudio, audio, s.crossfadeDuration, volume);
         else { audio.volume = volume; audio.play().catch(function () {}); }
         if (isAmb) { state.ambientAudio = audio; state.ambientPlaying = true; } else { state.musicAudio = audio; state.musicPlaying = true; }
         syncPlayerUI(); updateStatus('playing');
-    }, { once: true });
+    };
 
+    // `canplay` is more reliable than `canplaythrough` (which may not re-fire for
+    // cached media). Fall back to a readyState check + a short timeout so a clip
+    // never silently fails to start.
+    audio.addEventListener('canplay', start, { once: true });
+    audio.addEventListener('loadeddata', function () { if (audio.readyState >= 2) start(); }, { once: true });
+    setTimeout(function () { if (!started && audio.readyState >= 2) start(); }, 1500);
+
+    // Overlapping crossfade into the next library track (non-looping autoplay).
+    attachAutoCrossfade(type, audio);
+
+    // Fallback: if the clip ends without the pre-emptive crossfade having fired
+    // (e.g. crossfade disabled, or duration unknown), still advance the library.
     audio.addEventListener('ended', function () {
-        if (!loop) {
-            if (isAmb) state.ambientPlaying = false; else state.musicPlaying = false;
-            syncPlayerUI();
-            if (s.libraryEnabled && s.libraryAutoplay) setTimeout(function () { playNextFromLibrary(type); }, 500);
+        if (audio.loop) return;
+        if (isAmb) state.ambientPlaying = false; else state.musicPlaying = false;
+        syncPlayerUI();
+        if (s.libraryEnabled && s.libraryAutoplay && !audio._nextScheduled) {
+            audio._nextScheduled = true;
+            setTimeout(function () { playNextFromLibrary(type); }, 300);
         }
     });
 }
@@ -1184,5 +1239,5 @@ jQuery(async function () {
     if (event_types.CHAT_DELETED) eventSource.on(event_types.CHAT_DELETED, function (data) { onChatDeleted(typeof data === 'string' ? data : (data && (data.id || data.chatId || data.chat_id))); });
     if (event_types.GROUP_DELETED) eventSource.on(event_types.GROUP_DELETED, function (data) { onGroupDeleted(typeof data === 'string' ? data : (data && (data.id || data.groupId || data.group_id))); });
 
-    console.log(L, 'v1.9.0 loaded — per-engine settings memory active');
+    console.log(L, 'v1.9.1 loaded — per-engine settings memory + crossfade fix');
 });
