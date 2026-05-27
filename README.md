@@ -23,6 +23,7 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
 - **UNET model picker** — fetch available models directly from your ComfyUI instance
 - **Custom workflows** — supply your own ComfyUI workflow JSON for full control; template variables supported
 - **Auto-delete on chat removal** — optionally clean up saved track files when a chat or group is deleted
+- **Optional LLM Connection Profile** — route the scene-analysis call through a separate connection profile (e.g. a cheaper or more JSON-friendly model) and switch back to your main profile automatically — useful when your main RP preset doesn't reliably return clean JSON
 
 ---
 
@@ -158,6 +159,27 @@ Presets save the current combination of **UNET model**, **duration**, **steps**,
 
 ---
 
+## LLM Connection Profile *(optional)*
+
+AutoMusic sends a small analysis prompt to the LLM and expects a JSON response. Heavily-customised RP presets (e.g. **Freaky Frankenstein**) often inject location/time/persona blocks and other formatting rules that interfere with clean JSON output, so the analysis can silently fail.
+
+This setting lets you route **only AutoMusic's analysis call** through a different connection profile — for example a cheap general-purpose model with a plain preset — while your chat continues to use your main profile untouched.
+
+**How to enable it:**
+
+1. Make sure SillyTavern's built-in **Connection Profiles** extension is enabled
+2. Create a connection profile with the API / model / preset you want AutoMusic to use for analysis (a simple instruct preset that returns JSON cleanly is ideal)
+3. In **🎵 AutoMusic → ⚙️ Advanced Settings → 🔌 LLM Connection Profile**:
+   - Tick **Use a separate Connection Profile for scene analysis**
+   - Pick your analysis profile from the dropdown (use the 🔄 button to refresh the list)
+4. Done — AutoMusic now switches to that profile only for its analysis call and switches back automatically when finished
+
+> **Recovery:** if a page reload interrupts the call while AutoMusic is on the analysis profile, it stores the original profile name and restores it on the next load (within ~1.5 s).
+>
+> **Fail-safe:** if the Connection Profiles extension isn't installed or the named profile no longer exists, AutoMusic silently falls back to the currently selected profile — nothing breaks.
+
+---
+
 ## Audio Library
 
 The library stores all generated tracks on disk, organised by chat/group. Open it with **📚 Library**.
@@ -215,12 +237,17 @@ Generation requests are serialised through an internal queue — only one ComfyU
 **ComfyUI workflow error**
 - If you use a custom music workflow, make sure it contains `%unet_name%` as a placeholder — hardcoded model names will not be updated when you change the UNET model in settings
 
+**Extension is running but never generates anything / "no JSON" in console**
+- This usually means your chat preset is too opinionated and is wrapping the LLM response in extra text (location/time blocks, narration, etc.) instead of returning clean JSON. Common culprit: presets like **Freaky Frankenstein**.
+- Fix: enable **🔌 LLM Connection Profile** in Advanced Settings and route the analysis call through a cleaner profile — see the [LLM Connection Profile](#llm-connection-profile-optional) section above.
+
 ---
 
 ## Version History
 
 | Version | Changes |
 |---|---|
+| 1.9.2 | Optional LLM Connection Profile — route the analysis call through a separate (e.g. JSON-friendly) profile and switch back automatically; resilient to page reloads mid-call |
 | 1.9.1 | Fixed crossfade: tracks now overlap smoothly at end-of-track autoplay instead of cutting off abruptly; more reliable playback start |
 | 1.9.0 | Per-engine settings memory — duration/steps/CFG stored separately for each engine on each channel |
 | 1.8.0 | Stable Audio 3.0 engine, per-channel engine selection (assign any engine to ambient or music) |
