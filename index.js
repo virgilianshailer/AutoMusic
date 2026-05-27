@@ -1093,7 +1093,7 @@ function buildUI() {
         '<label class="checkbox_label"><input id="am_on" type="checkbox"/><span>Enabled</span></label>' +
         '<label class="checkbox_label"><input id="am_ambient_on" type="checkbox"/><span>Ambient sounds</span></label>' +
         '<label class="checkbox_label"><input id="am_music_on" type="checkbox"/><span>Background music</span></label>' +
-        '<label class="checkbox_label"><input id="am_gen_start" type="checkbox"/><span>Generate on chat start</span></label>' +
+        '<label class="checkbox_label" title="Generate music when a new chat is created (only the greeting is present). When you re-open an existing chat, the last saved track from the library is resumed instead."><input id="am_gen_start" type="checkbox"/><span>Generate on new chat</span></label>' +
         '<label class="checkbox_label"><input id="am_llm_params" type="checkbox"/><span>LLM picks BPM / key / time sig</span></label>' +
         '<label class="checkbox_label"><input id="am_show_gal" type="checkbox"/><span>Session gallery</span></label>' +
         '<label class="checkbox_label"><input id="am_lib_on" type="checkbox"/><span>Save to library (persistent)</span></label>' +
@@ -1391,12 +1391,46 @@ function onChatChanged() {
     updateStatus('idle'); $('#am_amb_name').text('—'); $('#am_mus_name').text('—');
     updateLibraryUI();
 
-    if (S().enabled && S().generateOnChatStart) {
-        var delay = (S().startDelay || 8) * 1000;
-        setTimeout(function () {
-            var text = getRecentText(S().contextMessages || 5);
-            if (text && text.trim().length > 20) { state.currentAmbientPrompt = ''; state.currentMusicPrompt = ''; processSceneChange(true); }
-        }, delay);
+    if (!S().enabled) return;
+
+    // Determine whether this is a brand-new chat (only the greeting is present)
+    // or a chat with existing history that the user is re-opening.
+    var ctx = getContext();
+    var chatLen = (ctx && ctx.chat) ? ctx.chat.length : 0;
+    var isFreshChat = chatLen <= 1; // only the greeting → fresh chat
+
+    if (isFreshChat) {
+        // Fresh chat: generate from the greeting if "Generate on chat start" is enabled.
+        if (S().generateOnChatStart) {
+            var delay = (S().startDelay || 8) * 1000;
+            setTimeout(function () {
+                var text = getRecentText(S().contextMessages || 5);
+                if (text && text.trim().length > 20) {
+                    state.currentAmbientPrompt = '';
+                    state.currentMusicPrompt = '';
+                    processSceneChange(true);
+                }
+            }, delay);
+        }
+        return;
+    }
+
+    // Existing chat with history: do NOT generate. Instead resume the last saved
+    // track(s) for this chat from the library, if available.
+    if (!S().libraryEnabled) return;
+
+    var ambList = getChatTracks('ambient');
+    var musList = getChatTracks('music');
+
+    if (S().ambientEnabled && ambList && ambList.length) {
+        var lastAmb = ambList[ambList.length - 1];
+        state.ambientLibIndex = ambList.length - 1;
+        playFromLibrary('ambient', lastAmb);
+    }
+    if (S().musicEnabled && musList && musList.length) {
+        var lastMus = musList[musList.length - 1];
+        state.musicLibIndex = musList.length - 1;
+        playFromLibrary('music', lastMus);
     }
 }
 
@@ -1433,5 +1467,5 @@ jQuery(async function () {
     // interrupted by a page reload while we were on the analysis profile.
     setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
 
-    console.log(L, 'v1.9.2 loaded — per-engine settings memory + crossfade fix + connection profile');
+    console.log(L, 'v1.9.3 loaded — fresh-chat gating + resume last library track on existing chats');
 });
