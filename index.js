@@ -1,5 +1,5 @@
 /**
- * AutoMusic — per-engine settings memory, fixed crossfade on track change,
+ * AutoMusic  — per-engine settings memory, fixed crossfade on track change,
  * optional Connection Profile for scene analysis (route LLM call through a
  * different profile, then auto-restore the main one).
  */
@@ -1432,6 +1432,15 @@ function onChatChanged() {
         state.musicLibIndex = musList.length - 1;
         playFromLibrary('music', lastMus);
     }
+
+    // playFromLibrary sets state.currentAmbientPrompt / currentMusicPrompt to the
+    // restored track's prompt. That would tell analyseAudio "current scene is X"
+    // and the LLM tends to answer changed:false on the very next analysis turn,
+    // blocking new generation as messages come in. We want the restored track to
+    // play back as a starting point, but treat the analytic state as empty so the
+    // next scene check is free to detect a shift and produce a fresh track.
+    state.currentAmbientPrompt = '';
+    state.currentMusicPrompt = '';
 }
 
 /* ============ INIT ============ */
@@ -1467,5 +1476,5 @@ jQuery(async function () {
     // interrupted by a page reload while we were on the analysis profile.
     setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
 
-    console.log(L, 'v1.9.3 loaded — fresh-chat gating + resume last library track on existing chats');
+    console.log(L, 'v1.9.4 loaded — fresh-chat gating + resume last library track on existing chats + analysis-state reset fix');
 });
