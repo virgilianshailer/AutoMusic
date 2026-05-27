@@ -1,5 +1,7 @@
 /**
- * AutoMusic v1.9.1 — per-engine settings memory, fixed crossfade on track change
+ * AutoMusic v1.9.2 — per-engine settings memory, fixed crossfade on track change,
+ * optional Connection Profile for scene analysis (route LLM call through a
+ * different profile, then auto-restore the main one).
  */
 import {
     eventSource, event_types, getRequestHeaders,
@@ -94,6 +96,14 @@ var DEFAULTS = {
     libraryAutoplay: true,
     autoDeleteOnChatRemove: false,
     savedTracks: {},
+    // --- Connection profile support ---
+    // Route AutoMusic's scene-analysis LLM call through a separate profile
+    // (e.g. a cheaper / JSON-friendly model) and switch back to the user's
+    // main profile when done. Requires SillyTavern's built-in Connection
+    // Profiles extension.
+    useConnectionProfile: false,
+    connectionProfile: '',   // name of the profile to use (empty = current/main)
+    _restoreProfile: '',     // internal: profile to restore if interrupted by reload
 };
 
 function S() { return extension_settings[M]; }
@@ -425,6 +435,136 @@ var DEFAULT_SA3_WF = JSON.stringify({
     "19": { "inputs": { "filename_prefix": "audio/AutoMusic_sa3", "quality": "V0", "audio": ["58", 0] }, "class_type": "SaveAudioMP3" }
 });
 
+/* ============ CONNECTION PROFILE SUPPORT ============ */
+// Slash-command runner — loaded lazily in init so a path change in
+// SillyTavern can never break the whole extension.
+var runSlash = null;
+
+// Returns the array of saved connection profiles, or [] if Connection
+// Manager isn't installed / enabled.
+function getProfileList() {
+    try {
+        var cm = extension_settings && extension_settings.connectionManager;
+        if (!cm || !Array.isArray(cm.profiles)) return [];
+        return cm.profiles;
+    } catch (e) { return []; }
+}
+
+// Returns the name of the currently selected connection profile,
+// or "" if none / unavailable.
+function getCurrentProfileName() {
+    try {
+        var cm = extension_settings && extension_settings.connectionManager;
+        if (!cm) return '';
+        var sel = cm.selectedProfile;
+        if (!sel) return '';
+        var found = (cm.profiles || []).find(function (p) { return p.id === sel; });
+        return found ? (found.name || '') : '';
+    } catch (e) { return ''; }
+}
+
+// True only if we actually can and should route the LLM call through
+// a different profile.
+function shouldSwitchProfile() {
+    var s = S();
+    if (!s.useConnectionProfile) return false;
+    if (!runSlash) return false;                       // slash runner not loaded
+    var target = (s.connectionProfile || '').trim();
+    if (!target) return false;                         // no target -> use main
+    if (getProfileList().length === 0) return false;   // CM not installed
+    var current = getCurrentProfileName();
+    if (current && current === target) return false;   // already on target
+    return true;
+}
+
+// Switch to a named profile via the official slash command and wait a bit
+// for the API / model / preset to settle.
+async function switchProfile(name) {
+    if (!runSlash || !name) return false;
+    try {
+        await runSlash('/profile "' + String(name).replace(/"/g, '\\"') + '"');
+        await new Promise(function (r) { setTimeout(r, 150); });
+        return true;
+    } catch (e) {
+        console.warn(L, "Failed to switch to profile '" + name + "':", e);
+        return false;
+    }
+}
+
+// Run an async LLM task on the configured profile, then always restore the
+// user's main profile. If switching isn't needed/possible, the task simply
+// runs on the current profile.
+async function withConnectionProfile(task) {
+    if (!shouldSwitchProfile()) {
+        return await task();
+    }
+    var s = S();
+    var original = getCurrentProfileName();
+    var target = (s.connectionProfile || '').trim();
+    var switched = false;
+    try {
+        switched = await switchProfile(target);
+        if (!switched) console.warn(L, 'Profile switch failed; running on current profile.');
+        // Persist which profile to return to in case the page reloads mid-call.
+        if (switched && original && original !== target) {
+            s._restoreProfile = original;
+            saveSettingsDebounced();
+        }
+        return await task();
+    } finally {
+        if (switched && original && original !== target) {
+            await switchProfile(original);
+        }
+        if (S()._restoreProfile) { S()._restoreProfile = ''; saveSettingsDebounced(); }
+    }
+}
+
+// Safety net: if a previous LLM call was interrupted (e.g. by page reload)
+// while we were on the analysis profile, the marker survives in settings.
+// On load, quietly switch back.
+async function recoverProfileIfNeeded() {
+    var s = S();
+    var pending = s._restoreProfile;
+    if (!pending || !runSlash) return;
+    try {
+        var current = getCurrentProfileName();
+        if (current !== pending && getProfileList().some(function (p) { return p.name === pending; })) {
+            console.log(L, "Recovering interrupted profile switch → restoring '" + pending + "'.");
+            await switchProfile(pending);
+        }
+    } catch (e) {
+        console.warn(L, 'Profile recovery failed:', e);
+    } finally {
+        s._restoreProfile = ''; saveSettingsDebounced();
+    }
+}
+
+// Fills the settings dropdown with the available connection profiles.
+function populateProfileDropdown() {
+    var $sel = $('#am_profile_sel');
+    if (!$sel.length) return;
+    var profiles = getProfileList();
+    var html = '<option value="">— Use current / main profile —</option>';
+    if (profiles.length === 0) {
+        html += '<option value="" disabled>(No profiles — install/enable Connection Profiles)</option>';
+    } else {
+        profiles.forEach(function (p) {
+            var name = p && p.name ? p.name : '';
+            if (!name) return;
+            html += '<option value="' + esc(name) + '">' + esc(name) + '</option>';
+        });
+    }
+    $sel.html(html);
+    var saved = (S().connectionProfile || '');
+    if (saved && profiles.some(function (p) { return p.name === saved; })) {
+        $sel.val(saved);
+    } else if (saved && profiles.length > 0) {
+        // Saved profile no longer exists — visually fall back, but keep the
+        // setting so the user notices the mismatch.
+        $sel.val('');
+    }
+}
+
 /* ============ LLM ============ */
 function buildAudioPrompt(text, llmParams) {
     var s = S();
@@ -477,7 +617,14 @@ function musicEngineUsesParams() {
 async function analyseAudio(text) {
     var wantParams = S().llmMusicParams && musicEngineUsesParams();
     var prompt = buildAudioPrompt(text, wantParams), raw = null;
-    try { raw = await generateQuietPrompt(prompt, false, false); } catch (e1) { try { raw = await generateQuietPrompt(prompt, false, true); } catch (e2) { return null; } }
+    // Route through the configured connection profile (if any), then auto-restore.
+    try {
+        raw = await withConnectionProfile(function () {
+            return generateQuietPrompt(prompt, false, false).catch(function () {
+                return generateQuietPrompt(prompt, false, true);
+            });
+        });
+    } catch (e) { return null; }
     if (!raw) return null;
     var c = raw.replace(/```(?:json)?\s*/gi, '').replace(/```/g, ''), f = c.indexOf('{'), l = c.lastIndexOf('}');
     if (f < 0 || l <= f) return null;
@@ -1040,6 +1187,14 @@ function buildUI() {
         '<div style="flex:2"><label style="font-size:.75em">ComfyUI URL:</label><input id="am_comfy_url" class="text_pole" placeholder="http://127.0.0.1:8188" style="font-size:.82em"/></div>' +
         '<div style="flex:1"><label style="font-size:.75em">Start delay (s):</label><input id="am_start_delay" type="number" class="text_pole" style="font-size:.82em"/></div></div></div>' +
 
+        '<div class="am-sg"><label style="font-size:.8em"><b>🔌 LLM Connection Profile</b></label>' +
+        '<label class="checkbox_label" style="margin-top:2px"><input id="am_use_profile" type="checkbox"/>' +
+        '<span style="font-size:.82em">Use a separate Connection Profile for scene analysis</span></label>' +
+        '<div style="font-size:.72em;opacity:.7;margin:2px 0 4px">Route AutoMusic\'s LLM analysis through a different (e.g. JSON-friendly) profile, then switch back automatically. Requires the built-in <b>Connection Profiles</b> extension.</div>' +
+        '<div id="am_profile_row" style="display:flex;gap:4px;align-items:center">' +
+        '<select id="am_profile_sel" class="text_pole" style="flex:1;font-size:.82em"></select>' +
+        '<div id="am_profile_refresh" class="menu_button" style="font-size:.82em;padding:2px 8px" title="Refresh profile list">🔄</div></div></div>' +
+
         '</details>' +
         '</div></div></div>';
 }
@@ -1071,6 +1226,10 @@ function settingsToUI() {
     $('#am_cooldown').val(s.cooldownSeconds); $('#am_context').val(s.contextMessages);
     $('#am_crossfade').val(s.crossfadeDuration); $('#am_comfy_url').val(s.comfyUrl || '');
     $('#am_start_delay').val(s.startDelay);
+    // Connection profile
+    $('#am_use_profile').prop('checked', !!s.useConnectionProfile);
+    $('#am_profile_row').toggle(!!s.useConnectionProfile);
+    populateProfileDropdown();
     $('[data-gal]').toggle(s.showGallery);
     syncPlayerUI(); updateGalleryBadge(); updateLibraryUI(); updatePresetsUI(); syncEngineUI();
 }
@@ -1113,6 +1272,21 @@ function bindUI() {
     $('#am_amb_sa3_wf').on('change', function () { s.ambientSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_sa3_wf').on('change', function () { s.musicSa3Workflow = $(this).val().trim(); saveSettingsDebounced(); });
     $('#am_mus_sa3_ckpt').on('change', function () { s.sa3CheckpointModel = $(this).val().trim(); saveSettingsDebounced(); });
+
+    // --- Connection Profile controls ---
+    $('#am_use_profile').on('change', function () {
+        s.useConnectionProfile = $(this).prop('checked');
+        $('#am_profile_row').toggle(s.useConnectionProfile);
+        saveSettingsDebounced();
+    });
+    $('#am_profile_sel').on('change', function () {
+        s.connectionProfile = $(this).val() || '';
+        saveSettingsDebounced();
+    });
+    $('#am_profile_refresh').on('click', function () {
+        populateProfileDropdown();
+        if (typeof toastr !== 'undefined') toastr.info('Connection profile list refreshed.', 'AutoMusic');
+    });
     // On engine change: switch the active engine, pull that engine's saved params
     // into the flat fields + input boxes, then refresh visibility.
     $('#am_amb_engine').on('change', function () {
@@ -1232,6 +1406,22 @@ jQuery(async function () {
     tgt.append(buildUI());
     loadSettings(); settingsToUI(); bindUI();
 
+    // Optional: load the slash-command runner used to switch connection
+    // profiles. Wrapped in its own try so a path change in SillyTavern can
+    // never break the whole extension — feature degrades gracefully.
+    try {
+        var sc = await import('../../../slash-commands.js');
+        if (typeof sc.executeSlashCommandsWithOptions === 'function') {
+            runSlash = sc.executeSlashCommandsWithOptions;
+        }
+    } catch (e) {
+        console.warn(L, 'slash-commands.js not available — Connection Profile switching disabled.', e);
+    }
+
+    // After the dropdown is bound, repopulate now that we know whether the
+    // Connection Manager extension is actually loaded.
+    populateProfileDropdown();
+
     state.lastChatKey = getChatKey();
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessage);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
@@ -1239,5 +1429,9 @@ jQuery(async function () {
     if (event_types.CHAT_DELETED) eventSource.on(event_types.CHAT_DELETED, function (data) { onChatDeleted(typeof data === 'string' ? data : (data && (data.id || data.chatId || data.chat_id))); });
     if (event_types.GROUP_DELETED) eventSource.on(event_types.GROUP_DELETED, function (data) { onGroupDeleted(typeof data === 'string' ? data : (data && (data.id || data.groupId || data.group_id))); });
 
-    console.log(L, 'v1.9.1 loaded — per-engine settings memory + crossfade fix');
+    // Safety net: restore the user's main profile if a previous LLM call was
+    // interrupted by a page reload while we were on the analysis profile.
+    setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
+
+    console.log(L, 'v1.9.2 loaded — per-engine settings memory + crossfade fix + connection profile');
 });
