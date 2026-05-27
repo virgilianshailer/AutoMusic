@@ -79,7 +79,7 @@ git clone https://github.com/virgilianshailer/AutoMusic
 | **Enabled** | Master on/off switch |
 | **Ambient sounds** | Enable/disable ambient channel (Stable Audio) |
 | **Background music** | Enable/disable music channel (ACE Step) |
-| **Generate on chat start** | Trigger generation when a chat is opened |
+| **Generate on new chat** | Trigger generation when a brand-new chat is opened (only the greeting is present). Existing chats with history resume the last saved track from the library instead |
 | **LLM picks BPM / key / time sig** | Let the model choose music theory parameters |
 | **Session gallery** | Show the in-session track gallery button |
 | **Save to library** | Persist generated tracks to disk per-chat |
@@ -247,6 +247,7 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.9.3 | "Generate on chat start" now only triggers for brand-new chats (greeting-only); re-opening an existing chat resumes the last saved track from the library instead of generating a new one |
 | 1.9.2 | Optional LLM Connection Profile — route the analysis call through a separate (e.g. JSON-friendly) profile and switch back automatically; resilient to page reloads mid-call |
 | 1.9.1 | Fixed crossfade: tracks now overlap smoothly at end-of-track autoplay instead of cutting off abruptly; more reliable playback start |
 | 1.9.0 | Per-engine settings memory — duration/steps/CFG stored separately for each engine on each channel |
