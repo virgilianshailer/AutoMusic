@@ -1,5 +1,5 @@
 /**
- * AutoMusic v1.9.2 — per-engine settings memory, fixed crossfade on track change,
+ * AutoMusic — per-engine settings memory, fixed crossfade on track change,
  * optional Connection Profile for scene analysis (route LLM call through a
  * different profile, then auto-restore the main one).
  */
