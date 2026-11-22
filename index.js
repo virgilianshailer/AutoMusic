@@ -11,7 +11,7 @@ import { extension_settings, getContext } from '../../../extensions.js';
 
 var M = 'auto_music';
 var L = '[AutoMusic]';
-var AM_VERSION = '1.16.0';
+var AM_VERSION = '1.16.1';
 
 function amSlayOwnsScreen() {
     try {
@@ -560,6 +560,83 @@ async function waitForComfyFree() {
     return false;
 }
 
+/* ACE Step 1.5 ships with three language-model text encoders (0.6B / 1.7B /
+   4B) and an install usually has only some of them. The built-in workflow
+   names 1.7B; a ComfyUI without that file rejected the whole prompt with
+   "Prompt outputs failed validation". Before submitting, every model input of
+   an ACE loader is checked against the list ComfyUI itself reports, and a
+   missing file is swapped for an installed one of the same family. */
+var comfyChoiceCache = {};
+async function comfyChoices(base, nodeClass, input) {
+    var key = base + '|' + nodeClass;
+    if (!comfyChoiceCache[key]) {
+        try {
+            var r = await fetch(base + '/object_info/' + encodeURIComponent(nodeClass));
+            comfyChoiceCache[key] = r.ok ? ((await r.json())[nodeClass] || null) : null;
+        } catch (e) { comfyChoiceCache[key] = null; }
+        if (!comfyChoiceCache[key]) { var k = key; setTimeout(function () { delete comfyChoiceCache[k]; }, 30000); }
+    }
+    var info = comfyChoiceCache[key], spec = info && info.input && ((info.input.required || {})[input] || (info.input.optional || {})[input]);
+    if (!spec) return null;
+    if (Array.isArray(spec[0])) return spec[0];
+    if (spec[0] === 'COMBO' && spec[1] && Array.isArray(spec[1].options)) return spec[1].options;
+    return null;
+}
+// Preference order when the requested file is missing (first installed wins).
+var ACE_LM_PREF = ['qwen_1.7b_ace15', 'qwen_4b_ace15', 'qwen_0.6b_ace15'];
+function pickInstalled(list, prefs, exclude) {
+    for (var i = 0; i < prefs.length; i++) {
+        for (var j = 0; j < list.length; j++) {
+            if (list[j] !== exclude && list[j].toLowerCase().indexOf(prefs[i]) === 0) return list[j];
+        }
+    }
+    return null;
+}
+async function adaptAceModels(base, obj) {
+    var swaps = [];
+    for (var id in obj) {
+        var n = obj[id], inp = n && n.inputs;
+        if (!inp) continue;
+        if (n.class_type === 'DualCLIPLoader' && inp.type === 'ace') {
+            var list = await comfyChoices(base, 'DualCLIPLoader', 'clip_name1');
+            if (!list) continue;
+            if (list.indexOf(inp.clip_name1) < 0) {
+                var c1 = pickInstalled(list, ['qwen_0.6b_ace15'], null);
+                if (c1) { swaps.push(inp.clip_name1 + ' → ' + c1); inp.clip_name1 = c1; }
+            }
+            if (list.indexOf(inp.clip_name2) < 0) {
+                var c2 = pickInstalled(list, ACE_LM_PREF, inp.clip_name1);
+                if (c2) { swaps.push(inp.clip_name2 + ' → ' + c2); inp.clip_name2 = c2; }
+            }
+        } else if (n.class_type === 'VAELoader' && /ace/i.test(String(inp.vae_name))) {
+            var vl = await comfyChoices(base, 'VAELoader', 'vae_name');
+            if (vl && vl.indexOf(inp.vae_name) < 0) {
+                var v = pickInstalled(vl, ['ace_1.5', 'ace'], null);
+                if (v) { swaps.push(inp.vae_name + ' → ' + v); inp.vae_name = v; }
+            }
+        }
+    }
+    if (swaps.length) console.log(L, 'ACE Step: using installed models instead of missing ones:', swaps.join(', '));
+    return obj;
+}
+// ComfyUI's top-level message ("Prompt outputs failed validation") names no
+// node; the details live in node_errors. Turn them into one readable line.
+function comfyErrorText(eb, obj) {
+    var msg = (eb && eb.error && eb.error.message) || 'request rejected', parts = [];
+    var ne = eb && eb.node_errors;
+    if (ne && typeof ne === 'object') {
+        for (var id in ne) {
+            var errs = (ne[id] && ne[id].errors) || [], cls = (ne[id] && ne[id].class_type) || (obj && obj[id] && obj[id].class_type) || ('node ' + id);
+            errs.forEach(function (e) {
+                var d = String(e.details || e.message || '');
+                if (d.length > 160) d = d.substring(0, 157) + '…';
+                parts.push(cls + ': ' + d);
+            });
+        }
+    }
+    return parts.length ? msg + ' — ' + parts.slice(0, 3).join('; ') : msg;
+}
+
 /* ============ DEFAULT WORKFLOWS ============ */
 var DEFAULT_AMBIENT_WF = JSON.stringify({
     "3": { "inputs": { "seed": "%seed%", "steps": "%steps%", "cfg": "%cfg%", "sampler_name": "dpmpp_3m_sde_gpu", "scheduler": "exponential", "denoise": 1, "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["11", 0] }, "class_type": "KSampler" },
@@ -879,6 +956,7 @@ async function generateAudioDirect(type, prompt, musicParams) {
             ep.duration, ep.steps, ep.cfg);
     }
     if (!obj) return null;
+    try { await adaptAceModels(base, obj); } catch (e) { console.warn(L, 'ACE model check skipped:', e.message); }
 
     updateStatus('gen-' + type);
     await waitForComfyFree();
@@ -888,7 +966,11 @@ async function generateAudioDirect(type, prompt, musicParams) {
     catch (e) { return null; }
     if (!qr.ok) {
         var eb; try { eb = await qr.json(); } catch (x) { eb = null; }
-        if (eb && eb.error) toastr.error('ComfyUI: ' + (eb.error.message || ''), 'AutoMusic');
+        if (eb && (eb.error || eb.node_errors)) {
+            var et = comfyErrorText(eb, obj);
+            console.warn(L, 'ComfyUI rejected the ' + type + ' workflow:', et, eb.node_errors || '');
+            toastr.error('ComfyUI: ' + et, 'AutoMusic', { timeOut: 12000 });
+        }
         return null;
     }
 

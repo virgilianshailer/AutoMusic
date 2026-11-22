@@ -238,6 +238,9 @@ Generation requests are serialised through an internal queue — only one ComfyU
 **"No UNETLoader info found" after clicking 🔄**
 - Make sure the ACE Step custom nodes are installed in ComfyUI (`TextEncodeAceStepAudio1.5`, `EmptyAceStep1.5LatentAudio`, `UNETLoader`)
 
+**"Prompt outputs failed validation"**
+- The toast names the node and the rejected value. A missing model file is the usual cause: download it into ComfyUI, or pick an installed one in settings. For ACE Step, AutoMusic already substitutes an installed `qwen_*_ace15` text encoder automatically
+
 **Stable Audio 3.0 engine produces nothing / errors**
 - Confirm `stable_audio_3_medium.safetensors` and the CLIP file `t5gemma_b_b_ul2.safetensors` are present in ComfyUI and that the names match your **SA3 Checkpoint** setting
 - SA3 is text-only — BPM/key/time-signature controls are intentionally hidden when SA3 is the music engine; describe tempo and mood directly in the scene text instead
@@ -265,6 +268,7 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.16.1 | ACE Step uses whichever ACE text encoders and VAE are installed in ComfyUI (e.g. `qwen_4b_ace15` when `qwen_1.7b_ace15` is missing) instead of failing validation; ComfyUI validation errors now name the node and value |
 | 1.16.0 | Movable HUD, separate music and ambient buttons, and a scrollable inline playlist |
 | 1.15.0 | Quick Player Widget HUD for the favorites player |
 | 1.14.3 | Tracks stored only as ComfyUI links are copied into SillyTavern on load; a toast explains a track that cannot be loaded; cleanup no longer deletes files that favorites use |
