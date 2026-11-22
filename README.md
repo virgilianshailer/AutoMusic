@@ -19,10 +19,14 @@ AutoMusic reads your chat context, asks the LLM to analyse the scene, then gener
 - **Crossfade transitions** — smooth overlapping fade between tracks both when the scene changes and when the library auto-plays the next track (the next clip starts a few seconds early so it blends in instead of cutting off)
 - **Persistent audio library** — generated tracks are saved per-chat and survive page reloads; supports shuffle and auto-play-next
 - **Session gallery** — quick in-session overview of everything generated this session with playback and download
+- **Favorites player** — pin tracks with ★ into a global playlist; music and ambient favorites play on two independent channels
+- **Quick Player Widget HUD** — control music and ambient favorites from a movable player inside the chat
 - **Music presets** — save/load UNET model + generation parameter sets for fast switching
 - **UNET model picker** — fetch available models directly from your ComfyUI instance
 - **Custom workflows** — supply your own ComfyUI workflow JSON for full control; template variables supported
 - **Auto-delete on chat removal** — optionally clean up saved track files when a chat or group is deleted
+- **Self-healing library** — tracks that only existed as ComfyUI output links are copied into SillyTavern automatically, so they keep playing when ComfyUI is offline
+- **Public API for other extensions** — `window.AutoMusicAPI` plays a mood brief or a temporary track without an LLM call
 - **Optional LLM Connection Profile** — route the scene-analysis call through a separate connection profile (e.g. a cheaper or more JSON-friendly model) and switch back to your main profile automatically — useful when your main RP preset doesn't reliably return clean JSON
 
 ---
@@ -188,6 +192,17 @@ The library stores all generated tracks on disk, organised by chat/group. Open i
 - Play (▶), download (💾), or delete (✕) individual tracks
 - Delete all tracks for a specific chat with 🗑 per-chat
 - **Delete All Tracks** removes every saved file across all chats
+- Press ★ on a track to add it to the favorites player; files a favorite points to are never removed by chat cleanup
+
+---
+
+## Quick Player Widget HUD
+
+In **Extensions → AutoMusic → ⭐ Player**, check **Quick Player Widget HUD** to show the player above the chat composer. Use the ★ button in the library or session gallery to add tracks to the playlist.
+
+Use **Music** and **Ambient** to start or pause each channel independently. Expand the widget with the chevron to skip tracks, toggle repeat-one, or open **Playlist** and scroll through favorites inside the widget. The full-screen playlist is accessible through the expand icon beside **Playlist** and through the folder button in the AutoMusic settings.
+
+Drag the grip with a mouse or your finger to move the widget. Activate the grip while the widget is floating to return it above the chat composer. SillyTavern remembers the position, visibility, and expanded state of the widget.
 
 ---
 
@@ -234,6 +249,9 @@ Generation requests are serialised through an internal queue — only one ComfyU
 **Tracks disappear after page reload**
 - Enable **Save to library** — without it, tracks are only kept for the current session
 
+**A track shows up but does not play ("… is not reachable")**
+- Older tracks may still point at ComfyUI's output folder instead of a file stored in SillyTavern. Start ComfyUI and reload the page — AutoMusic copies such tracks into SillyTavern a few seconds after load, and they play without ComfyUI from then on
+
 **ComfyUI workflow error**
 - If you use a custom music workflow, make sure it contains `%unet_name%` as a placeholder — hardcoded model names will not be updated when you change the UNET model in settings
 
@@ -247,6 +265,10 @@ Generation requests are serialised through an internal queue — only one ComfyU
 
 | Version | Changes |
 |---|---|
+| 1.16.0 | Movable HUD, separate music and ambient buttons, and a scrollable inline playlist |
+| 1.15.0 | Quick Player Widget HUD for the favorites player |
+| 1.14.3 | Tracks stored only as ComfyUI links are copied into SillyTavern on load; a toast explains a track that cannot be loaded; cleanup no longer deletes files that favorites use |
+| 1.10–1.14 | Favorites player (★, two independent channels, repeat-one), public `window.AutoMusicAPI` for other extensions, library upload fixes |
 | 1.9.3 | "Generate on chat start" now only triggers for brand-new chats (greeting-only); re-opening an existing chat resumes the last saved track from the library instead of generating a new one |
 | 1.9.2 | Optional LLM Connection Profile — route the analysis call through a separate (e.g. JSON-friendly) profile and switch back automatically; resilient to page reloads mid-call |
 | 1.9.1 | Fixed crossfade: tracks now overlap smoothly at end-of-track autoplay instead of cutting off abruptly; more reliable playback start |

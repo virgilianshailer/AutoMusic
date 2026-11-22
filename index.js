@@ -11,6 +11,20 @@ import { extension_settings, getContext } from '../../../extensions.js';
 
 var M = 'auto_music';
 var L = '[AutoMusic]';
+var AM_VERSION = '1.16.0';
+
+function amSlayOwnsScreen() {
+    try {
+        if (typeof window === 'undefined') return false;
+        var standalone = window.MesugakiCampaign;
+        if (standalone && standalone.isOpen && standalone.isOpen()) return true;
+        var game = window.SlayCampaign;
+        if (game && typeof game.isOpen === 'function' && game.isOpen()) return true;
+        var lib = window.CharacterLibrary;
+        var campaign = lib && typeof lib.getActiveCampaign === 'function' ? lib.getActiveCampaign() : null;
+        return !!(campaign && ['slay-run', 'mesugaki-rpg'].includes(campaign.mode));
+    } catch (e) { return false; }
+}
 
 /* ============ MUSIC THEORY ============ */
 var KEYSCALES = [
@@ -96,6 +110,16 @@ var DEFAULTS = {
     libraryAutoplay: true,
     autoDeleteOnChatRemove: false,
     savedTracks: {},
+    // --- Player favorites (global, shared across ALL chats) ---
+    // A flat playlist of tracks the user pinned from the gallery/library.
+    // Each entry mirrors a library track: {id, prompt, type, url, path, params, time}.
+    favorites: [],
+    // Repeat-one for the favorites player: the track you started keeps looping
+    // in its channel instead of advancing. Applies to music and ambient alike.
+    favRepeatOne: false,
+    quickPlayerEnabled: false,
+    quickPlayerExpanded: false,
+    quickPlayerPosition: null,
     // --- Connection profile support ---
     // Route AutoMusic's scene-analysis LLM call through a separate profile
     // (e.g. a cheaper / JSON-friendly model) and switch back to the user's
@@ -167,6 +191,7 @@ function loadSettings() {
 
     if (!s.savedTracks) s.savedTracks = {};
     if (!s.musicPresets) s.musicPresets = {};
+    if (!Array.isArray(s.favorites)) s.favorites = [];
 }
 
 /* ============ PER-ENGINE PARAMS ============ */
@@ -208,6 +233,17 @@ function syncFlatParams(channel) {
 /* ============ STATE ============ */
 var state = {
     ambientAudio: null, musicAudio: null,
+    /* ephemeral host-boot score (see amApiPlayBrief/amApiEndBrief): the live
+       session token, and the track it produced so endBrief can silence
+       exactly that one and nothing newer */
+    briefSession: null, briefTrack: null,
+    /* a host track that must SURVIVE the next chat change (endBrief with
+       stop:false) — the boot score keeps playing into the campaign instead of
+       cutting to silence while the campaign's own score is still rendering */
+    carryTrack: null,
+    /* the chat a host has already scored through playBrief: our own
+       on-chat-start pass would be a duplicate AND a wasted analyseAudio call */
+    hostScoredChat: null,
     currentAmbientPrompt: '', currentMusicPrompt: '',
     lastGenerateTime: 0, generating: false,
     ambientPlaying: false, musicPlaying: false,
@@ -216,6 +252,16 @@ var state = {
     messageCounter: 0,
     ambientLibIndex: -1, musicLibIndex: -1,
     lastChatKey: null,
+    // --- Favorites player (two independent channels: music + ambient can play together) ---
+    fav: {
+        music:   { audio: null, index: -1 },
+        ambient: { audio: null, index: -1 },
+    },
+    quickQueueOpen: false,
+    // A sibling extension can temporarily take over the music channel (for
+    // example the Inventory smartphone player) without destroying the track
+    // that AutoMusic should resume afterwards.
+    externalOverride: null,
 };
 
 /* ============ UTILITIES ============ */
@@ -245,29 +291,40 @@ function getChatKey() {
     if (ctx.chatId) return String(ctx.chatId);
     return 'default';
 }
-function getChatStore() {
-    var s = S(), key = getChatKey();
+function getChatStoreByKey(key) {
+    var s = S();
     if (!s.savedTracks) s.savedTracks = {};
     if (!s.savedTracks[key]) s.savedTracks[key] = { ambient: [], music: [], name: '' };
+    return s.savedTracks[key];
+}
+function getChatStore() {
+    var store = getChatStoreByKey(getChatKey());
     var ctx = getContext();
     if (ctx.characters && ctx.characterId !== undefined && ctx.characters[ctx.characterId]) {
-        s.savedTracks[key].name = ctx.characters[ctx.characterId].name || '';
+        store.name = ctx.characters[ctx.characterId].name || '';
     } else if (ctx.groupId && ctx.groups) {
         var g = ctx.groups.find(function (gr) { return gr.id === ctx.groupId; });
-        if (g) s.savedTracks[key].name = g.name || '';
+        if (g) store.name = g.name || '';
     }
-    return s.savedTracks[key];
+    return store;
 }
 function getChatTracks(type) { return type === 'ambient' ? getChatStore().ambient : getChatStore().music; }
 
 /* ============ FILE DELETION HELPER ============ */
 async function deleteTrackFiles(trackList) {
     if (!trackList || !trackList.length) return;
+    // A favorite reuses its library track's file: deleting the library entry
+    // (or the chat) must not pull the file out from under the player.
+    var pinned = {};
+    getFavorites().forEach(function (f) { if (f.path) pinned[f.path] = true; });
     for (var i = 0; i < trackList.length; i++) {
         var track = trackList[i];
+        if (track.path && pinned[track.path]) continue;
         if (track.path) {
             try {
-                await fetch('/api/files/delete', { method: 'POST', headers: Object.assign({}, getRequestHeaders(), { 'Content-Type': 'application/json' }), body: JSON.stringify({ name: track.path }) });
+                /* the endpoint reads `path`, not `name` — with the old key every
+                   delete came back 400 and the file stayed behind */
+                await fetch('/api/files/delete', { method: 'POST', headers: Object.assign({}, getRequestHeaders(), { 'Content-Type': 'application/json' }), body: JSON.stringify({ path: track.path }) });
             } catch (e) { console.warn(L, 'Could not delete file:', track.path, e.message); }
         }
     }
@@ -310,33 +367,141 @@ function deleteAllTracksFromLibrary() {
 }
 
 /* ============ SAVE TO LIBRARY ============ */
+// The extension it belongs to, spelled the way SillyTavern's upload endpoint
+// demands: ONE flat segment. validateAssetFileName() rejects '/' outright, so
+// the old 'automusic/<type>/<file>' name was refused with 400 on EVERY track
+// ever generated — the whole library was links into ComfyUI's output folder,
+// alive only while ComfyUI is up (fix 2026-08-08).
+function libraryFileName(type, prompt, sourceUrl) {
+    var safeName = (prompt || 'track').replace(/[^a-zA-Z0-9_\- ]/g, '').substring(0, 40).trim().replace(/ /g, '_');
+    /* ComfyUI decides the container (mp3 / flac / wav); a hardcoded .mp3 on a
+       flac payload would be served under the wrong type and refuse to play */
+    var ext = 'mp3', m = /[?&]filename=([^&]*)/.exec(String(sourceUrl || ''));
+    if (m) {
+        var dot = decodeURIComponent(m[1]).lastIndexOf('.');
+        if (dot !== -1) {
+            var raw = decodeURIComponent(m[1]).substring(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (raw) ext = raw;
+        }
+    }
+    return ('automusic_' + type + '_' + Date.now() + '_' + safeName).replace(/[^a-zA-Z0-9_\-]/g, '') + '.' + ext;
+}
 async function saveAudioToLibrary(type, prompt, sourceUrl, params) {
     var audioBlob;
     try {
         var resp = await fetch(sourceUrl);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         audioBlob = await resp.blob();
-    } catch (e) { return null; }
-    var ts = Date.now(), safeName = (prompt || 'track').replace(/[^a-zA-Z0-9_\- ]/g, '').substring(0, 40).trim().replace(/ /g, '_');
-    var filename = type + '_' + ts + '_' + safeName + '.mp3';
+    } catch (e) { console.warn(L, 'library: cannot fetch the generated audio —', e.message); return null; }
+    var filename = libraryFileName(type, prompt, sourceUrl);
     try {
         var reader = new FileReader();
         var b64 = await new Promise(function (resolve) { reader.onload = function () { resolve(reader.result.split(',')[1]); }; reader.readAsDataURL(audioBlob); });
         var uploadResp = await fetch('/api/files/upload', {
             method: 'POST', headers: Object.assign({}, getRequestHeaders(), { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ name: 'automusic/' + type + '/' + filename, data: b64 }),
+            body: JSON.stringify({ name: filename, data: b64 }),
         });
-        if (uploadResp.ok) return { filename: filename, path: 'automusic/' + type + '/' + filename };
-    } catch (e2) { }
+        if (uploadResp.ok) {
+            /* the server answers with the URL the client can fetch it from —
+               that URL IS the durable copy, so it becomes the track's url and
+               ComfyUI is out of the loop from here on */
+            var info = await uploadResp.json();
+            if (info && info.path) return { filename: filename, path: info.path, url: info.path };
+        } else {
+            /* silence here is what hid the 400 for 110 tracks in a row */
+            console.warn(L, 'library: upload refused —', uploadResp.status, await uploadResp.text());
+        }
+    } catch (e2) { console.warn(L, 'library: upload failed —', e2.message); }
     return { filename: filename, path: null, url: sourceUrl };
 }
 function getTrackPlayUrl(track) {
     if (track.url) return track.url;
-    if (track.path) return '/api/files/get?name=' + encodeURIComponent(track.path);
+    /* `path` is what /api/files/upload answered: a client-relative URL, already
+       served by SillyTavern. There is no /api/files/get endpoint — the old
+       fallback pointed at one that has never existed. */
+    if (track.path) return track.path.charAt(0) === '/' ? track.path : '/' + track.path;
     return null;
 }
-function addTrackToLibrary(type, prompt, sourceUrl, params) {
-    var list = getChatTracks(type), entry = { prompt: prompt || '', url: sourceUrl, params: params || null, time: new Date().toISOString(), id: Date.now() + '_' + Math.random().toString(36).substr(2, 6) };
+
+/* ============ COMFYUI-LINK RESCUE (1.14.3) ============ */
+// Tracks saved before the 2026-08-08 upload fix — and favorites pinned while
+// their upload was still running — hold ONLY a ComfyUI /view URL and no `path`.
+// They play while ComfyUI is up and go silent the moment it is not (the
+// favorites player showed them as present but ▶ did nothing). This pass moves
+// every such track onto a SillyTavern-served copy under a STABLE name derived
+// from the ComfyUI file, so a favorite and its library twin share one copy and
+// a copy placed in user/files by hand (rescue-copy.js) is picked up as-is.
+function comfyLinkInfo(url) {
+    var m = /\/view\?(.*)$/.exec(String(url || ''));
+    if (!m || !/^https?:\/\//i.test(String(url))) return null;
+    var q = new URLSearchParams(m[1]), filename = q.get('filename');
+    if (!filename) return null;
+    return { filename: filename, subfolder: q.get('subfolder') || '', type: q.get('type') || 'output' };
+}
+function rescuedFileName(info) {
+    return ('automusic_comfy_' + (info.subfolder ? info.subfolder + '_' : '') + info.filename).replace(/[^a-zA-Z0-9_\-.]/g, '');
+}
+function isComfyOnlyTrack(track) { return !!(track && !track.path && comfyLinkInfo(track.url)); }
+// Returns true when the track now points at a SillyTavern copy.
+async function localizeTrack(track) {
+    if (!isComfyOnlyTrack(track)) return false;
+    var name = rescuedFileName(comfyLinkInfo(track.url)), local = '/user/files/' + name;
+    var adopt = function (p) { track.url = p; track.path = p; track.filename = name; return true; };
+    // 1) a copy is already there (an earlier pass, or copied off disk)
+    try { var h = await fetch(local, { method: 'HEAD', cache: 'no-store' }); if (h.ok) return adopt(local); } catch (e) { /* fall through */ }
+    // 2) ComfyUI is up: pull the file and upload it under the stable name
+    var blob;
+    try { var r = await fetch(track.url); if (!r.ok) return false; blob = await r.blob(); } catch (e2) { return false; }
+    try {
+        var b64 = await new Promise(function (resolve, reject) {
+            var fr = new FileReader();
+            fr.onload = function () { resolve(String(fr.result).split(',')[1]); };
+            fr.onerror = function () { reject(fr.error); };
+            fr.readAsDataURL(blob);
+        });
+        var up = await fetch('/api/files/upload', {
+            method: 'POST', headers: Object.assign({}, getRequestHeaders(), { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ name: name, data: b64 }),
+        });
+        if (!up.ok) { console.warn(L, 'rescue: upload refused —', up.status, await up.text()); return false; }
+        var res = await up.json();
+        return res && res.path ? adopt(res.path) : false;
+    } catch (e3) { console.warn(L, 'rescue: upload failed —', e3.message); return false; }
+}
+var rescueRunning = false;
+async function rescueComfyLinks(quiet) {
+    if (rescueRunning) return; rescueRunning = true;
+    try {
+        var s = S(), all = getFavorites().slice();
+        Object.keys(s.savedTracks || {}).forEach(function (k) {
+            var st = s.savedTracks[k]; all = all.concat(st.ambient || [], st.music || []);
+        });
+        var todo = all.filter(isComfyOnlyTrack);
+        if (!todo.length) return;
+        var moved = 0;
+        for (var i = 0; i < todo.length; i++) { if (await localizeTrack(todo[i])) moved++; }
+        if (moved) { saveSettingsDebounced(); updateLibraryUI(); renderFavOverlayList(); }
+        var left = todo.length - moved;
+        console.log(L, 'rescue: ' + moved + ' ComfyUI-only track(s) moved into SillyTavern storage, ' + left + ' still ComfyUI-only');
+        if (!quiet && moved) toastr.success(moved + ' track(s) moved from ComfyUI into SillyTavern storage', 'AutoMusic');
+        if (!quiet && left) toastr.warning(left + ' track(s) exist only in ComfyUI, which is not reachable. Start ComfyUI and reload to keep them.', 'AutoMusic', { timeOut: 10000 });
+    } finally { rescueRunning = false; }
+}
+function warnUnplayable(track, url) {
+    var where = 'its file';
+    var ci = comfyLinkInfo(url);
+    if (ci) { try { where = 'ComfyUI at ' + new URL(url).host; } catch (e) { where = 'ComfyUI'; } }
+    var label = String((track && track.prompt) || url || '').substring(0, 50);
+    toastr.warning('Cannot load "' + label + '…" — ' + where + ' is not reachable.' + (ci ? ' Start ComfyUI and the track will be copied into SillyTavern.' : ''), 'AutoMusic', { timeOut: 8000 });
+}
+// `chatKey` (optional) pins the track to the chat that REQUESTED the generation.
+// Generation takes minutes; without the pin, a chat switch mid-generation would
+// file the track under whatever chat is open when ComfyUI finishes (or under
+// 'default' on the start screen).
+function addTrackToLibrary(type, prompt, sourceUrl, params, chatKey) {
+    var store = chatKey ? getChatStoreByKey(chatKey) : getChatStore();
+    var list = (type === 'ambient') ? store.ambient : store.music;
+    var entry = { prompt: prompt || '', url: sourceUrl, params: params || null, time: new Date().toISOString(), id: Date.now() + '_' + Math.random().toString(36).substr(2, 6) };
     saveAudioToLibrary(type, prompt, sourceUrl, params).then(function (fileInfo) {
         if (fileInfo) { entry.filename = fileInfo.filename; entry.path = fileInfo.path; if (fileInfo.url) entry.url = fileInfo.url; saveSettingsDebounced(); }
     });
@@ -603,7 +768,10 @@ function buildAudioPrompt(text, llmParams) {
         (llmParams ?
             '{"ambient":{"changed":true/false,"prompt":"..."},"music":{"changed":true/false,"prompt":"...","bpm":120,"keyscale":"A minor","timesignature":"4","lyrics":""}}\n\n' :
             '{"ambient":{"changed":true/false,"prompt":"..."},"music":{"changed":true/false,"prompt":"...","lyrics":""}}\n\n') +
-        'lyrics must always be empty string "".\n\n' +
+        'lyrics must always be empty string "".\n' +
+        /* §9.2: the prompt string goes straight into the T5/Qwen text encoders
+           of the audio model, which are English-trained. */
+        'Write every "prompt" in ENGLISH ONLY, whatever language the story is in.\n\n' +
         '--- TEXT ---\n' + text + '\n--- END ---';
 }
 
@@ -806,11 +974,26 @@ function playAudio(type, url) {
     var loop = isAmb ? s.ambientLoop : s.musicLoop;
     var oldAudio = isAmb ? state.ambientAudio : state.musicAudio;
     var audio = new Audio(url);
-    audio.loop = loop; audio.preload = 'auto';
+    // Auto-play-next and native loop are mutually exclusive: a looping clip
+    // never fires 'ended', so while library autoplay is ON the loop flag is
+    // suppressed and the playlist advances; with autoplay OFF the channel's
+    // Loop checkbox keeps the current track repeating.
+    audio.loop = loop && !(s.libraryEnabled && s.libraryAutoplay);
+    audio.preload = 'auto';
 
     var started = false;
     var start = function () {
         if (started) return; started = true;
+        if (!isAmb && state.externalOverride) {
+            if (oldAudio && !oldAudio.paused) oldAudio.pause();
+            audio.volume = volume;
+            state.musicAudio = audio;
+            state.musicPlaying = false;
+            state.externalOverride.baseAudio = audio;
+            state.externalOverride.baseWasPlaying = true;
+            syncPlayerUI(); updateStatus('playing');
+            return;
+        }
         if (oldAudio && !oldAudio.paused) crossfade(oldAudio, audio, s.crossfadeDuration, volume);
         else { audio.volume = volume; audio.play().catch(function () {}); }
         if (isAmb) { state.ambientAudio = audio; state.ambientPlaying = true; } else { state.musicAudio = audio; state.musicPlaying = true; }
@@ -822,6 +1005,7 @@ function playAudio(type, url) {
     // never silently fails to start.
     audio.addEventListener('canplay', start, { once: true });
     audio.addEventListener('loadeddata', function () { if (audio.readyState >= 2) start(); }, { once: true });
+    audio.addEventListener('error', function () { if (!started && !audio._stopping) warnUnplayable(null, url); });
     setTimeout(function () { if (!started && audio.readyState >= 2) start(); }, 1500);
 
     // Overlapping crossfade into the next library track (non-looping autoplay).
@@ -829,14 +1013,27 @@ function playAudio(type, url) {
 
     // Fallback: if the clip ends without the pre-emptive crossfade having fired
     // (e.g. crossfade disabled, or duration unknown), still advance the library.
+    // Settings are re-read here (not from the closure) so checkboxes toggled
+    // MID-track take effect at the end of this track.
     audio.addEventListener('ended', function () {
-        if (audio.loop) return;
+        if (audio.loop || audio._stopping) return;
+        var live = S();
+        if (live.libraryEnabled && live.libraryAutoplay) {
+            if (!audio._nextScheduled) {
+                audio._nextScheduled = true;
+                setTimeout(function () { playNextFromLibrary(type); }, 300);
+            }
+            return;
+        }
+        // Autoplay off → honor the channel's Loop checkbox: restart this track.
+        if (isAmb ? live.ambientLoop : live.musicLoop) {
+            audio.loop = true;
+            audio.currentTime = 0;
+            audio.play().catch(function () {});
+            return;
+        }
         if (isAmb) state.ambientPlaying = false; else state.musicPlaying = false;
         syncPlayerUI();
-        if (s.libraryEnabled && s.libraryAutoplay && !audio._nextScheduled) {
-            audio._nextScheduled = true;
-            setTimeout(function () { playNextFromLibrary(type); }, 300);
-        }
     });
 }
 
@@ -851,19 +1048,31 @@ function setVolume(type, vol) {
     var audio = type === 'ambient' ? state.ambientAudio : state.musicAudio, muted = type === 'ambient' ? S().ambientMuted : S().musicMuted;
     if (audio) audio.volume = muted ? 0 : vol;
     if (type === 'ambient') S().ambientVolume = vol; else S().musicVolume = vol;
+    // The favorites player rides on the matching channel's volume/mute.
+    var fc = state.fav[type === 'ambient' ? 'ambient' : 'music'];
+    if (fc && fc.audio) fc.audio.volume = muted ? 0 : vol;
     saveSettingsDebounced();
 }
 
 function toggleMute(type) {
     var s = S();
-    if (type === 'ambient') { s.ambientMuted = !s.ambientMuted; if (state.ambientAudio) state.ambientAudio.volume = s.ambientMuted ? 0 : s.ambientVolume; }
-    else { s.musicMuted = !s.musicMuted; if (state.musicAudio) state.musicAudio.volume = s.musicMuted ? 0 : s.musicVolume; }
+    if (type === 'ambient') { s.ambientMuted = !s.ambientMuted; if (state.ambientAudio) state.ambientAudio.volume = s.ambientMuted ? 0 : s.ambientVolume; if (state.fav.ambient.audio) state.fav.ambient.audio.volume = s.ambientMuted ? 0 : s.ambientVolume; }
+    else { s.musicMuted = !s.musicMuted; if (state.musicAudio) state.musicAudio.volume = s.musicMuted ? 0 : s.musicVolume; if (state.fav.music.audio) state.fav.music.audio.volume = s.musicMuted ? 0 : s.musicVolume; }
     saveSettingsDebounced(); syncPlayerUI();
 }
 
 function toggleLock(type) {
     var s = S(); if (type === 'ambient') s.ambientLocked = !s.ambientLocked; else s.musicLocked = !s.musicLocked;
     saveSettingsDebounced(); syncPlayerUI();
+}
+
+// Re-apply the effective loop flag to the LIVE audio elements whenever any of
+// the loop / autoplay checkboxes change (autoplay-next suppresses native loop —
+// see playAudio). Without this, toggles only affect the NEXT track.
+function applyLoopFlags() {
+    var s = S(), autoplayOn = s.libraryEnabled && s.libraryAutoplay;
+    if (state.ambientAudio) state.ambientAudio.loop = s.ambientLoop && !autoplayOn;
+    if (state.musicAudio) state.musicAudio.loop = s.musicLoop && !autoplayOn;
 }
 
 /* ============ GALLERY ============ */
@@ -879,6 +1088,7 @@ function openGallery() {
             '<div class="am-gal-text"><span class="am-gal-prompt" title="' + esc(t.prompt) + '">' + esc(t.prompt) + '</span>' + paramsStr + '</div>' +
             '<span class="am-gal-time">' + esc(t.time) + '</span></div><div class="am-gal-actions">' +
             '<button class="am-btn-sm am-gal-play" data-idx="' + i + '" title="Play">▶</button>' +
+            '<button class="am-btn-sm am-gal-fav" data-idx="' + i + '" title="Add to player">★</button>' +
             '<a class="am-btn-sm am-gal-dl" href="' + esc(t.url) + '" download="automusic_' + t.type + '_' + i + '.mp3" title="Download">💾</a></div></div>';
     }
     var ov = $('<div id="am_gallery_overlay"><div class="am-gal-header"><span>📋 Session Gallery</span><span class="am-gal-count">' + tracks.length + '</span><span class="am-gal-close">✕</span></div><div class="am-gal-list">' + html + '</div></div>');
@@ -888,6 +1098,548 @@ function openGallery() {
         playAudio(track.type, track.url);
         if (track.type === 'ambient') { state.currentAmbientPrompt = track.prompt; $('#am_amb_name').text(track.prompt).attr('title', track.prompt); }
         else { state.currentMusicPrompt = track.prompt; $('#am_mus_name').text(track.prompt).attr('title', track.prompt); }
+    });
+    ov.find('.am-gal-fav').on('click', function () {
+        var idx = parseInt($(this).data('idx')), track = tracks[idx]; if (!track) return;
+        addToFavorites(track, track.type);
+    });
+}
+
+/* ============ FAVORITES PLAYER ============ */
+// Favorites are a GLOBAL playlist (not chat-keyed): tracks the user pinned from
+// the session gallery or the per-chat library. They reuse the same on-server
+// files as library tracks, so they persist and are playable from any chat.
+
+function getFavorites() { var s = S(); if (!Array.isArray(s.favorites)) s.favorites = []; return s.favorites; }
+
+// Build a stable signature so the same underlying audio file isn't pinned twice.
+function favSig(track) {
+    if (!track) return '';
+    return (track.path || track.url || '') + '|' + (track.prompt || '');
+}
+function isFavorite(track) {
+    var sig = favSig(track);
+    return getFavorites().some(function (f) { return favSig(f) === sig; });
+}
+
+// Add a track (from gallery or library) to the global favorites playlist.
+// Returns true if added, false if it was already there.
+function addToFavorites(track, type) {
+    if (!track) return false;
+    if (isFavorite(track)) { toastr.info('Already in player', 'AutoMusic'); return false; }
+    var entry = {
+        id: 'fav_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+        prompt: track.prompt || '',
+        type: type || track.type || 'music',
+        url: track.url || null,
+        path: track.path || null,
+        params: track.params || null,
+        time: track.time || new Date().toISOString(),
+    };
+    getFavorites().push(entry);
+    saveSettingsDebounced();
+    updateFavBadge();
+    toastr.success('★ Added to player', 'AutoMusic');
+    return true;
+}
+function removeFromFavorites(id) {
+    var favs = getFavorites();
+    for (var i = 0; i < favs.length; i++) {
+        if (favs[i].id === id) {
+            var ch = favChannel(favs[i].type);
+            // If we're removing the track currently loaded in its channel, stop it.
+            if (i === state.fav[ch].index) stopFavoriteChannel(ch);
+            favs.splice(i, 1);
+            // Fix up indices for the channels (both, since the array is shared).
+            ['music', 'ambient'].forEach(function (c) {
+                if (state.fav[c].index > i) state.fav[c].index--;
+                else if (state.fav[c].index === i) state.fav[c].index = -1;
+            });
+            break;
+        }
+    }
+    saveSettingsDebounced(); updateFavBadge();
+}
+
+/* --- Playback ---
+ * The favorites player has two independent channels — 'music' and 'ambient' —
+ * so a music track and an ambient track can play AT THE SAME TIME, exactly like
+ * the auto-music engine. Each channel owns its own <audio> element and its own
+ * position in the shared playlist. These streams are separate from the
+ * auto-music channels so they never fight over playback. */
+function favChannel(type) { return type === 'ambient' ? 'ambient' : 'music'; }
+function favVolumeFor(type) {
+    var s = S();
+    return type === 'ambient'
+        ? (s.ambientMuted ? 0 : (s.ambientVolume || 0.5))
+        : (s.musicMuted ? 0 : (s.musicVolume || 0.3));
+}
+
+function stopFavoriteChannel(ch) {
+    var c = state.fav[ch];
+    if (c.audio) { c.audio._stopping = true; c.audio.pause(); c.audio.removeAttribute('src'); c.audio.load(); }
+    c.audio = null;
+    syncFavPlayerUI();
+}
+function stopFavorites() {
+    stopFavoriteChannel('music');
+    stopFavoriteChannel('ambient');
+}
+
+// Play the favorite at `index` in ITS OWN channel (music/ambient), leaving the
+// other channel untouched so both can sound together.
+function playFavoriteAt(index) {
+    var favs = getFavorites();
+    if (!favs.length) return;
+    if (index < 0) index = favs.length - 1;
+    if (index >= favs.length) index = 0;
+    var track = favs[index];
+    var url = getTrackPlayUrl(track);
+    if (!url) { toastr.warning('Track file unavailable', 'AutoMusic'); return; }
+
+    var ch = favChannel(track.type);
+    var c = state.fav[ch];
+
+    // Stop only this channel's previous stream (the other channel keeps playing).
+    if (c.audio) { c.audio._stopping = true; c.audio.pause(); c.audio.removeAttribute('src'); c.audio.load(); }
+
+    var audio = new Audio(url);
+    audio.preload = 'auto';
+    audio.loop = !!S().favRepeatOne;   // repeat-one: native loop, 'ended' never fires
+    c.audio = audio;
+    c.index = index;
+
+    audio.volume = favVolumeFor(track.type);
+    audio.play().catch(function () {});
+    // A dead source used to fail in silence (the ▶ just did nothing).
+    audio.addEventListener('error', function () {
+        if (audio._stopping || c.audio !== audio) return;
+        c.audio = null; syncFavPlayerUI(); warnUnplayable(track, url);
+    });
+    // Still a ComfyUI-only link but it loads → ComfyUI is up, take a copy now.
+    if (isComfyOnlyTrack(track)) {
+        audio.addEventListener('canplay', function () {
+            localizeTrack(track).then(function (ok) { if (ok) saveSettingsDebounced(); });
+        }, { once: true });
+    }
+
+    // When this track ends, auto-advance to the next track OF THE SAME TYPE.
+    audio.addEventListener('ended', function () {
+        if (audio._stopping) return;
+        playNextFavoriteIn(ch);
+    });
+    audio.addEventListener('pause', function () { if (!audio._stopping) syncFavPlayerUI(); });
+    audio.addEventListener('play', function () { syncFavPlayerUI(); });
+
+    syncFavPlayerUI();
+}
+
+// Find the next/previous favorite index whose type maps to channel `ch`,
+// starting from that channel's current position. Returns -1 if none exist.
+function adjacentFavoriteIndex(ch, dir) {
+    var favs = getFavorites();
+    var matches = [];
+    for (var i = 0; i < favs.length; i++) { if (favChannel(favs[i].type) === ch) matches.push(i); }
+    if (!matches.length) return -1;
+    var curIdx = state.fav[ch].index;
+    var pos = matches.indexOf(curIdx);
+    if (pos === -1) return dir > 0 ? matches[0] : matches[matches.length - 1];
+    var next = (pos + dir + matches.length) % matches.length;
+    return matches[next];
+}
+// Repeat-one toggle: flip the setting and re-apply it to BOTH live channels, so
+// a track already playing starts/stops looping without a restart.
+function toggleFavRepeatOne() {
+    var s = S();
+    s.favRepeatOne = !s.favRepeatOne;
+    ['music', 'ambient'].forEach(function (c) { if (state.fav[c].audio) state.fav[c].audio.loop = s.favRepeatOne; });
+    saveSettingsDebounced();
+    syncFavPlayerUI();
+}
+function syncFavRepeatBtn() {
+    var on = !!S().favRepeatOne;
+    $('#am_fav_repeat, #am_fav_ovl_repeat, #am_quick_repeat').toggleClass('am-repeat-on', on)
+        .attr('aria-pressed', String(on))
+        .attr('title', on ? 'Repeat one: ON — the current track loops' : 'Repeat one: OFF — playlist advances');
+}
+function playNextFavoriteIn(ch) { var idx = adjacentFavoriteIndex(ch, 1); if (idx >= 0) playFavoriteAt(idx); }
+function playPrevFavoriteIn(ch) { var idx = adjacentFavoriteIndex(ch, -1); if (idx >= 0) playFavoriteAt(idx); }
+
+// Is anything currently sounding in either channel?
+function anyFavPlaying() {
+    return ['music', 'ambient'].some(function (c) { return state.fav[c].audio && !state.fav[c].audio.paused; });
+}
+
+function toggleFavoriteTrack(index) {
+    var track = getFavorites()[index];
+    if (!track) return;
+    var channel = state.fav[favChannel(track.type)];
+    if (channel.index !== index || !channel.audio) {
+        playFavoriteAt(index);
+    } else if (channel.audio.paused) {
+        channel.audio.play().catch(function () {});
+    } else {
+        channel.audio.pause();
+    }
+}
+
+function toggleFavoriteChannel(ch) {
+    var channel = state.fav[ch];
+    toggleFavoriteTrack(channel.index >= 0 ? channel.index : adjacentFavoriteIndex(ch, 1));
+}
+
+// Mini-bar play/pause: acts on BOTH channels together. If anything is playing,
+// pause everything; otherwise resume/start each channel.
+function toggleFavPlayPause() {
+    var favs = getFavorites();
+    if (!favs.length) { toastr.info('Player is empty — add tracks with ★', 'AutoMusic'); return; }
+
+    if (anyFavPlaying()) {
+        ['music', 'ambient'].forEach(function (c) { if (state.fav[c].audio && !state.fav[c].audio.paused) state.fav[c].audio.pause(); });
+        return;
+    }
+
+    // Nothing playing → resume any paused streams, and for empty channels start
+    // the first track of that type if one exists.
+    var resumedOrStarted = false;
+    ['music', 'ambient'].forEach(function (c) {
+        var st = state.fav[c];
+        if (st.audio && st.audio.src) { st.audio.play().catch(function () {}); resumedOrStarted = true; }
+        else {
+            var first = adjacentFavoriteIndex(c, 1);
+            // adjacentFavoriteIndex with no current pos returns the first match.
+            if (st.index < 0 && first >= 0) { playFavoriteAt(first); resumedOrStarted = true; }
+            else if (st.index >= 0) { playFavoriteAt(st.index); resumedOrStarted = true; }
+        }
+    });
+    if (!resumedOrStarted) playFavoriteAt(0);
+}
+
+// Mini-bar prev/next: advance whichever channels actually have tracks. With both
+// a music and an ambient track present, this steps both playlists in parallel.
+function playNextFavorite() {
+    var advanced = false;
+    ['music', 'ambient'].forEach(function (c) { if (adjacentFavoriteIndex(c, 1) >= 0 && (state.fav[c].audio || state.fav[c].index >= 0)) { playNextFavoriteIn(c); advanced = true; } });
+    if (!advanced) { var idx = adjacentFavoriteIndex('music', 1); if (idx < 0) idx = adjacentFavoriteIndex('ambient', 1); if (idx >= 0) playFavoriteAt(idx); }
+}
+function playPrevFavorite() {
+    var moved = false;
+    ['music', 'ambient'].forEach(function (c) { if (adjacentFavoriteIndex(c, -1) >= 0 && (state.fav[c].audio || state.fav[c].index >= 0)) { playPrevFavoriteIn(c); moved = true; } });
+    if (!moved) { var idx = adjacentFavoriteIndex('music', -1); if (idx < 0) idx = adjacentFavoriteIndex('ambient', -1); if (idx >= 0) playFavoriteAt(idx); }
+}
+
+// --- Player UI sync ---
+function updateFavBadge() {
+    var n = getFavorites().length;
+    $('#am_fav_count').text(n || '0');
+    $('#am_fav_badge').text(n || '');
+    n > 0 ? $('#am_fav_badge').show() : $('#am_fav_badge').hide();
+    renderQuickPlayerQueue();
+    syncFavPlayerUI();
+}
+function favChannelLabel(ch) {
+    var favs = getFavorites(), st = state.fav[ch];
+    if (st.audio && favs[st.index]) return (ch === 'ambient' ? '🔊 ' : '🎵 ') + favs[st.index].prompt;
+    return '';
+}
+function syncFavPlayerUI() {
+    var favs = getFavorites();
+    var playing = anyFavPlaying();
+    $('#am_fav_playpause').html(playing ? '⏸' : '▶');
+    var parts = [];
+    var mus = favChannelLabel('music'); if (mus) parts.push(mus);
+    var amb = favChannelLabel('ambient'); if (amb) parts.push(amb);
+    var label = parts.length ? parts.join('  +  ') : (favs.length ? 'Ready — ' + favs.length + ' track(s)' : 'Player empty');
+    $('#am_fav_now, #am_quick_now').text(label).attr('title', label);
+    syncQuickPlayerPlayback(favs);
+    syncFavRepeatBtn();
+    if ($('#am_favplayer_overlay').length) renderFavOverlayList();
+}
+
+// --- Quick Player Widget HUD ---
+function buildQuickPlayerHUD() {
+    return `
+        <aside id="am_quick_hud" aria-label="AutoMusic quick player" hidden>
+            <div class="am-quick-head">
+                <button id="am_quick_drag" type="button" class="am-btn-sm" aria-label="Drag player to move it" title="Drag player to move it">
+                    <i class="fa-solid fa-grip" aria-hidden="true"></i>
+                </button>
+                <div class="am-quick-caption">
+                    <span class="am-quick-label">AutoMusic</span>
+                    <span id="am_quick_now" role="status">Player empty</span>
+                </div>
+                <button id="am_quick_toggle" type="button" class="am-btn-sm" aria-expanded="false" aria-controls="am_quick_panel am_quick_queue" aria-label="Show player controls" title="Show player controls">
+                    <i class="fa-solid fa-chevron-up" aria-hidden="true"></i>
+                </button>
+            </div>
+            <div class="am-quick-playback">
+                <button id="am_quick_music" type="button" class="am-btn-sm am-quick-primary">
+                    <i class="fa-solid fa-play" aria-hidden="true"></i> Music
+                </button>
+                <button id="am_quick_ambient" type="button" class="am-btn-sm am-quick-primary">
+                    <i class="fa-solid fa-play" aria-hidden="true"></i> Ambient
+                </button>
+            </div>
+            <div id="am_quick_panel" hidden>
+                <button id="am_quick_prev" type="button" class="am-btn-sm" aria-label="Previous favorite" title="Previous favorite">
+                    <i class="fa-solid fa-backward-step" aria-hidden="true"></i>
+                </button>
+                <button id="am_quick_next" type="button" class="am-btn-sm" aria-label="Next favorite" title="Next favorite">
+                    <i class="fa-solid fa-forward-step" aria-hidden="true"></i>
+                </button>
+                <button id="am_quick_repeat" type="button" class="am-btn-sm" aria-label="Repeat one" aria-pressed="false" title="Repeat one">
+                    <i class="fa-solid fa-repeat" aria-hidden="true"></i>
+                </button>
+                <button id="am_quick_playlist" type="button" class="am-btn-sm" aria-expanded="false" aria-controls="am_quick_queue" title="Show inline playlist">
+                    <i class="fa-solid fa-list-ul" aria-hidden="true"></i> Playlist
+                </button>
+                <button id="am_quick_playlist_full" type="button" class="am-btn-sm" aria-label="Open full-screen playlist" title="Open full-screen playlist">
+                    <i class="fa-solid fa-up-right-and-down-left-from-center" aria-hidden="true"></i>
+                </button>
+            </div>
+            <div id="am_quick_queue" hidden>
+                <ul id="am_quick_queue_list" aria-label="Favorites playlist" role="list"></ul>
+                <p id="am_quick_queue_empty" hidden>No favorites yet. Add tracks with ★ in the library or gallery.</p>
+            </div>
+        </aside>`;
+}
+
+function renderQuickPlayerQueue() {
+    var favs = getFavorites();
+    var rows = favs.map(function (track, index) {
+        var ambient = favChannel(track.type) === 'ambient';
+        var icon = ambient ? 'fa-volume-high' : 'fa-music';
+        var type = ambient ? 'Ambient' : 'Music';
+        var name = track.prompt || type + ' ' + (index + 1);
+        return `<li class="am-quick-queue-item">
+            <button type="button" class="am-quick-queue-track" data-index="${index}" aria-pressed="false">
+                <i class="fa-solid ${icon}" role="img" aria-label="${type}"></i>
+                <span class="am-quick-track-name">${esc(name)}</span>
+                <i class="fa-solid fa-play am-quick-track-action" aria-hidden="true"></i>
+            </button>
+        </li>`;
+    });
+    $('#am_quick_queue_list').html(rows.join('')).prop('hidden', !favs.length);
+    $('#am_quick_queue_empty').prop('hidden', !!favs.length);
+}
+
+function syncQuickPlayerPlayback(favs) {
+    $('#am_quick_prev, #am_quick_next').prop('disabled', !favs.length);
+    var list = document.getElementById('am_quick_queue_list');
+    if (!list) return;
+    $(list).find('.am-quick-current').removeClass('am-quick-current').attr('aria-pressed', 'false').find('.am-quick-track-action')
+        .removeClass('fa-pause').addClass('fa-play');
+    ['music', 'ambient'].forEach(function (ch) {
+        var current = state.fav[ch];
+        var audible = current.audio && !current.audio.paused;
+        var action = (audible ? 'Pause ' : 'Play ') + ch;
+        var available = favs.some(function (track) { return favChannel(track.type) === ch; });
+        $('#am_quick_' + ch).attr({ 'aria-label': action, title: action }).prop('disabled', !available)
+            .find('i').toggleClass('fa-play', !audible).toggleClass('fa-pause', !!audible);
+        var row = current.audio && list.children[current.index];
+        if (row) {
+            $(row.firstElementChild).addClass('am-quick-current').attr('aria-pressed', String(!!audible)).find('.am-quick-track-action')
+                .toggleClass('fa-play', !audible).toggleClass('fa-pause', !!audible);
+        }
+    });
+}
+
+function setQuickPlayerFloating(hud, floating) {
+    var anchor = document.getElementById('am_quick_anchor');
+    var parent = floating ? document.body : anchor;
+    if (hud.parentElement !== parent) parent.append(hud);
+    anchor.hidden = floating || hud.hidden;
+    hud.classList.toggle('am-quick-floating', floating);
+    var label = floating ? 'Drag player to move it or click here to dock it' : 'Drag player to move it';
+    $('#am_quick_drag').attr({ 'aria-label': label, title: label });
+    if (!floating) {
+        hud.style.removeProperty('left');
+        hud.style.removeProperty('top');
+    }
+}
+
+function placeQuickPlayerHUD(hud, x, y) {
+    var viewport = window.visualViewport;
+    var width = viewport?.width ?? document.documentElement.clientWidth;
+    var height = viewport?.height ?? document.documentElement.clientHeight;
+    var inset = 6;
+    var minX = (viewport?.offsetLeft ?? 0) + inset;
+    var minY = (viewport?.offsetTop ?? 0) + inset;
+    hud.style.setProperty('--am-quick-viewport-width', width + 'px');
+    hud.style.setProperty('--am-quick-viewport-height', height + 'px');
+    x = Math.max(minX, Math.min(x, minX + width - hud.offsetWidth - 2 * inset));
+    y = Math.max(minY, Math.min(y, minY + height - hud.offsetHeight - 2 * inset));
+    hud.style.left = x + 'px';
+    hud.style.top = y + 'px';
+    return { x: x, y: y };
+}
+
+function syncQuickPlayerHUD() {
+    var s = S(), expanded = !!s.quickPlayerExpanded;
+    var hud = document.getElementById('am_quick_hud');
+    if (!hud) return;
+    var chat = document.getElementById('chat');
+    // Keep the most recent message in view when the dock changes the chat's height.
+    var atBottom = chat && chat.scrollHeight - chat.clientHeight - chat.scrollTop <= 2;
+    hud.hidden = !s.quickPlayerEnabled;
+    $('#am_quick_panel').prop('hidden', !expanded);
+    var action = expanded ? 'Hide player controls' : 'Show player controls';
+    $('#am_quick_toggle').attr({ 'aria-expanded': String(expanded), 'aria-label': action, title: action });
+    var queueOpen = expanded && state.quickQueueOpen;
+    $('#am_quick_queue').prop('hidden', !queueOpen);
+    $('#am_quick_playlist').attr({ 'aria-expanded': String(queueOpen), title: queueOpen ? 'Hide inline playlist' : 'Show inline playlist' });
+    var saved = s.quickPlayerPosition;
+    var floating = Number.isFinite(saved?.x) && Number.isFinite(saved?.y);
+    setQuickPlayerFloating(hud, floating);
+    if (floating && !hud.hidden) placeQuickPlayerHUD(hud, saved.x, saved.y);
+    if (atBottom) chat.scrollTop = chat.scrollHeight;
+}
+
+function bindQuickPlayerHUD() {
+    var hud = document.getElementById('am_quick_hud');
+    if (!hud) return;
+    var handle = document.getElementById('am_quick_drag');
+    var drag = null;
+    var moved = false;
+
+    handle.addEventListener('pointerdown', function (event) {
+        if (drag || !event.isPrimary || event.button !== 0) return;
+        var rect = hud.getBoundingClientRect();
+        moved = false;
+        drag = {
+            id: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            offsetX: event.clientX - rect.left,
+            offsetY: event.clientY - rect.top,
+            position: null,
+        };
+    });
+    window.addEventListener('pointermove', function (event) {
+        if (!drag || drag.id !== event.pointerId) return;
+        if (!moved) {
+            if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 5) return;
+            moved = true;
+            setQuickPlayerFloating(hud, true);
+            hud.classList.add('am-quick-dragging');
+            // Capture after reparenting the HUD so the handle keeps receiving pointer events.
+            handle.setPointerCapture(event.pointerId);
+        }
+        drag.position = placeQuickPlayerHUD(hud, event.clientX - drag.offsetX, event.clientY - drag.offsetY);
+    });
+    var finishDrag = function (event) {
+        if (!drag || (event.type !== 'blur' && drag.id !== event.pointerId)) return;
+        var position = drag.position;
+        drag = null;
+        hud.classList.remove('am-quick-dragging');
+        if (position) {
+            S().quickPlayerPosition = position;
+            saveSettingsDebounced();
+        }
+    };
+    window.addEventListener('pointerup', finishDrag);
+    window.addEventListener('pointercancel', finishDrag);
+    window.addEventListener('blur', finishDrag);
+    handle.addEventListener('click', function (event) {
+        if ((moved && event.detail) || !S().quickPlayerPosition) return;
+        S().quickPlayerPosition = null;
+        syncQuickPlayerHUD();
+        handle.focus({ preventScroll: true });
+        saveSettingsDebounced();
+    });
+
+    var fitViewport = function () {
+        var pos = drag?.position || S().quickPlayerPosition;
+        if (pos && !hud.hidden && hud.classList.contains('am-quick-floating')) {
+            placeQuickPlayerHUD(hud, pos.x, pos.y);
+        }
+    };
+    window.addEventListener('resize', fitViewport);
+    window.visualViewport?.addEventListener('resize', fitViewport);
+    window.visualViewport?.addEventListener('scroll', fitViewport);
+    // A favorites edit can change the floating HUD's height with the playlist open.
+    new ResizeObserver(fitViewport).observe(hud);
+}
+
+// --- Full-screen favorites overlay (playlist manager) ---
+function openFavPlayer() {
+    if ($('#am_favplayer_overlay').length) return;
+    var opener = document.activeElement;
+    var ov = $('<div id="am_favplayer_overlay">' +
+        '<div class="am-gal-header"><span>⭐ Player</span>' +
+        '<span class="am-gal-count" id="am_fav_ovl_count">0</span>' +
+        '<button type="button" class="am-btn-sm am-gal-close" aria-label="Close player playlist">✕</button></div>' +
+        '<div class="am-fav-controls">' +
+            '<button class="am-btn-sm" id="am_fav_ovl_prev" title="Previous">⏮</button>' +
+            '<button class="am-btn-sm" id="am_fav_ovl_playpause" title="Play / Pause">▶</button>' +
+            '<button class="am-btn-sm" id="am_fav_ovl_next" title="Next">⏭</button>' +
+            '<button class="am-btn-sm" id="am_fav_ovl_stop" title="Stop all">⏹</button>' +
+            '<button class="am-btn-sm" id="am_fav_ovl_repeat" title="Repeat one">🔂</button>' +
+            '<span class="am-fav-ovl-now" id="am_fav_ovl_now">Player empty</span>' +
+        '</div>' +
+        '<div class="am-fav-hint">🎵 Music and 🔊 ambient play on separate channels — start one of each to layer them.</div>' +
+        '<div class="am-gal-list" id="am_fav_ovl_list"></div></div>');
+    $('body').append(ov);
+
+    var close = function () { ov.remove(); opener?.focus(); };
+    ov.find('.am-gal-close').on('click', close).trigger('focus');
+    ov.on('keydown', function (event) {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+    });
+    ov.find('#am_fav_ovl_prev').on('click', playPrevFavorite);
+    ov.find('#am_fav_ovl_next').on('click', playNextFavorite);
+    ov.find('#am_fav_ovl_stop').on('click', stopFavorites);
+    ov.find('#am_fav_ovl_playpause').on('click', toggleFavPlayPause);
+    ov.find('#am_fav_ovl_repeat').on('click', toggleFavRepeatOne);
+
+    renderFavOverlayList();
+}
+function renderFavOverlayList() {
+    var $list = $('#am_fav_ovl_list'); if (!$list.length) return;
+    var favs = getFavorites();
+    $('#am_fav_ovl_count').text(favs.length);
+
+    $('#am_fav_ovl_playpause').html(anyFavPlaying() ? '⏸' : '▶');
+    var parts = [];
+    var mus = favChannelLabel('music'); if (mus) parts.push(mus);
+    var amb = favChannelLabel('ambient'); if (amb) parts.push(amb);
+    syncFavRepeatBtn();
+    $('#am_fav_ovl_now').text(parts.length ? parts.join('  +  ') : (favs.length ? favs.length + ' track(s)' : 'Player empty'));
+
+    if (!favs.length) { $list.html('<div class="am-lib-empty">No tracks yet. Use the ★ button in the gallery or library to add tracks here.</div>'); return; }
+
+    var html = '';
+    for (var i = 0; i < favs.length; i++) {
+        var t = favs[i], pStr = '';
+        if (t.params) { var pp = []; if (t.params.bpm) pp.push(t.params.bpm + ' BPM'); if (t.params.keyscale) pp.push(t.params.keyscale); pStr = pp.length ? '<span class="am-gal-params">' + esc(pp.join(' · ')) + '</span>' : ''; }
+        var ch = favChannel(t.type);
+        var isCur = (i === state.fav[ch].index);
+        var chPlaying = isCur && state.fav[ch].audio && !state.fav[ch].audio.paused;
+        html += '<div class="am-lib-item' + (isCur ? ' am-fav-current' : '') + '">' +
+            '<div class="am-gal-info"><span class="am-gal-type">' + (t.type === 'ambient' ? '🔊' : '🎵') + '</span>' +
+            '<div class="am-gal-text"><span class="am-gal-prompt">' + esc(t.prompt) + '</span>' + pStr + '</div></div>' +
+            '<div class="am-gal-actions">' +
+            '<button class="am-btn-sm am-fav-ovl-play" data-idx="' + i + '" title="Play">' + (chPlaying ? '⏸' : '▶') + '</button>' +
+            (t.url || t.path ? '<a class="am-btn-sm am-gal-dl" href="' + esc(getTrackPlayUrl(t) || '') + '" download title="Download">💾</a>' : '') +
+            '<button class="am-btn-sm am-fav-ovl-del" data-id="' + esc(t.id) + '" title="Remove" style="color:#ef4444">✕</button>' +
+            '</div></div>';
+    }
+    $list.html(html);
+
+    $list.find('.am-fav-ovl-play').off('click').on('click', function () {
+        var idx = parseInt($(this).data('idx'));
+        var tr = favs[idx]; if (!tr) return;
+        var ch = favChannel(tr.type), c = state.fav[ch];
+        // Clicking the track currently playing in its channel pauses just that channel.
+        if (idx === c.index && c.audio && !c.audio.paused) { c.audio.pause(); }
+        else playFavoriteAt(idx);
+    });
+    $list.find('.am-fav-ovl-del').off('click').on('click', function () {
+        var id = $(this).data('id');
+        removeFromFavorites(id);
     });
 }
 
@@ -909,14 +1661,14 @@ function openLibrary() {
         var t = musList[i], pStr = '';
         if (t.params) { var pp = []; if (t.params.bpm) pp.push(t.params.bpm + ' BPM'); if (t.params.keyscale) pp.push(t.params.keyscale); pStr = pp.length ? '<span class="am-gal-params">' + esc(pp.join(' · ')) + '</span>' : ''; }
         html += '<div class="am-lib-item"><div class="am-gal-info"><span class="am-gal-type">🎵</span><div class="am-gal-text"><span class="am-gal-prompt">' + esc(t.prompt) + '</span>' + pStr + '</div><span class="am-gal-time">' + esc(new Date(t.time).toLocaleDateString()) + '</span></div>' +
-            '<div class="am-gal-actions"><button class="am-btn-sm am-lib-play" data-type="music" data-idx="' + i + '">▶</button><a class="am-btn-sm am-gal-dl" href="' + esc(t.url || '') + '" download>💾</a><button class="am-btn-sm am-lib-del" data-type="music" data-id="' + esc(t.id) + '" style="color:#ef4444">✕</button></div></div>';
+            '<div class="am-gal-actions"><button class="am-btn-sm am-lib-play" data-type="music" data-idx="' + i + '">▶</button><button class="am-btn-sm am-lib-fav" data-type="music" data-idx="' + i + '" title="Add to player">★</button><a class="am-btn-sm am-gal-dl" href="' + esc(t.url || '') + '" download>💾</a><button class="am-btn-sm am-lib-del" data-type="music" data-id="' + esc(t.id) + '" style="color:#ef4444">✕</button></div></div>';
     }
     html += '</div><div class="am-lib-section" data-section="ambient" style="display:none">';
     if (!ambList.length) html += '<div class="am-lib-empty">No ambient tracks.</div>';
     else for (var j = ambList.length - 1; j >= 0; j--) {
         var a = ambList[j];
         html += '<div class="am-lib-item"><div class="am-gal-info"><span class="am-gal-type">🔊</span><div class="am-gal-text"><span class="am-gal-prompt">' + esc(a.prompt) + '</span></div><span class="am-gal-time">' + esc(new Date(a.time).toLocaleDateString()) + '</span></div>' +
-            '<div class="am-gal-actions"><button class="am-btn-sm am-lib-play" data-type="ambient" data-idx="' + j + '">▶</button><a class="am-btn-sm am-gal-dl" href="' + esc(a.url || '') + '" download>💾</a><button class="am-btn-sm am-lib-del" data-type="ambient" data-id="' + esc(a.id) + '" style="color:#ef4444">✕</button></div></div>';
+            '<div class="am-gal-actions"><button class="am-btn-sm am-lib-play" data-type="ambient" data-idx="' + j + '">▶</button><button class="am-btn-sm am-lib-fav" data-type="ambient" data-idx="' + j + '" title="Add to player">★</button><a class="am-btn-sm am-gal-dl" href="' + esc(a.url || '') + '" download>💾</a><button class="am-btn-sm am-lib-del" data-type="ambient" data-id="' + esc(a.id) + '" style="color:#ef4444">✕</button></div></div>';
     }
     html += '</div><div class="am-lib-section" data-section="all" style="display:none">';
 
@@ -943,10 +1695,14 @@ function openLibrary() {
         ov.find('.am-lib-section').hide(); ov.find('.am-lib-section[data-section="' + tab + '"]').show();
     });
     ov.find('#am_lib_shuffle_dlg').on('change', function () { s.libraryShuffle = $(this).prop('checked'); saveSettingsDebounced(); });
-    ov.find('#am_lib_autoplay_dlg').on('change', function () { s.libraryAutoplay = $(this).prop('checked'); saveSettingsDebounced(); });
+    ov.find('#am_lib_autoplay_dlg').on('change', function () { s.libraryAutoplay = $(this).prop('checked'); applyLoopFlags(); saveSettingsDebounced(); });
     ov.find('.am-lib-play').on('click', function () {
         var type = $(this).data('type'), idx = parseInt($(this).data('idx')), list = getChatTracks(type), track = list[idx]; if (!track) return;
         playFromLibrary(type, track); toastr.info((type === 'ambient' ? '🔊 ' : '🎵 ') + track.prompt.substring(0, 40), 'Library');
+    });
+    ov.find('.am-lib-fav').on('click', function () {
+        var type = $(this).data('type'), idx = parseInt($(this).data('idx')), list = getChatTracks(type), track = list[idx]; if (!track) return;
+        addToFavorites(track, type);
     });
     ov.find('.am-lib-del').on('click', function () { var type = $(this).data('type'), id = $(this).data('id'); $(this).closest('.am-lib-item').fadeOut(200, function () { $(this).remove(); }); removeFromLibrary(type, id); });
     ov.find('.am-lib-clear-chat').on('click', function () {
@@ -972,6 +1728,11 @@ async function processSceneChange(forceGenerate) {
     if (ambLocked && musLocked) return;
 
     state.generating = true; updateStatus('analyzing');
+    // Pin the chat this generation belongs to. Analysis + ComfyUI take minutes;
+    // if the user switches chats (or returns to the start screen) meanwhile,
+    // the finished track must be saved under THIS chat's library and must NOT
+    // start playing over whatever chat is open by then.
+    var chatKey = getChatKey();
     try {
         var analysis;
         try { analysis = await analyseAudio(text); } catch (e) { console.error(L, 'analyseAudio error:', e); }
@@ -988,11 +1749,13 @@ async function processSceneChange(forceGenerate) {
             try {
                 var ambUrl = await generateAudioQueued('ambient', analysis.ambient.prompt, null);
                 if (ambUrl) {
-                    state.currentAmbientPrompt = analysis.ambient.prompt; playAudio('ambient', ambUrl);
-                    $('#am_amb_name').text(analysis.ambient.prompt).attr('title', analysis.ambient.prompt);
                     addToGallery('ambient', analysis.ambient.prompt, ambUrl, null);
-                    if (s.libraryEnabled) addTrackToLibrary('ambient', analysis.ambient.prompt, ambUrl, null);
-                    toastr.info('🔊 ' + analysis.ambient.prompt.substring(0, 50), 'AutoMusic', { timeOut: 4000 });
+                    if (s.libraryEnabled) addTrackToLibrary('ambient', analysis.ambient.prompt, ambUrl, null, chatKey);
+                    if (getChatKey() === chatKey) {
+                        state.currentAmbientPrompt = analysis.ambient.prompt; playAudio('ambient', ambUrl);
+                        $('#am_amb_name').text(analysis.ambient.prompt).attr('title', analysis.ambient.prompt);
+                        toastr.info('🔊 ' + analysis.ambient.prompt.substring(0, 50), 'AutoMusic', { timeOut: 4000 });
+                    }
                 }
             } catch (e) { console.error(L, 'Ambient gen error:', e); }
         }
@@ -1009,12 +1772,14 @@ async function processSceneChange(forceGenerate) {
             try {
                 var musUrl = await generateAudioQueued('music', analysis.music.prompt, musicParams);
                 if (musUrl) {
-                    state.currentMusicPrompt = analysis.music.prompt; playAudio('music', musUrl);
-                    var infoText = analysis.music.prompt + ' [' + musicParams.bpm + ' BPM, ' + musicParams.keyscale + ']';
-                    $('#am_mus_name').text(infoText).attr('title', infoText);
                     addToGallery('music', analysis.music.prompt, musUrl, musicParams);
-                    if (s.libraryEnabled) addTrackToLibrary('music', analysis.music.prompt, musUrl, musicParams);
-                    toastr.info('🎵 ' + infoText.substring(0, 60), 'AutoMusic', { timeOut: 4000 });
+                    if (s.libraryEnabled) addTrackToLibrary('music', analysis.music.prompt, musUrl, musicParams, chatKey);
+                    if (getChatKey() === chatKey) {
+                        state.currentMusicPrompt = analysis.music.prompt; playAudio('music', musUrl);
+                        var infoText = analysis.music.prompt + ' [' + musicParams.bpm + ' BPM, ' + musicParams.keyscale + ']';
+                        $('#am_mus_name').text(infoText).attr('title', infoText);
+                        toastr.info('🎵 ' + infoText.substring(0, 60), 'AutoMusic', { timeOut: 4000 });
+                    }
                 }
             } catch (e) { console.error(L, 'Music gen error:', e); }
         }
@@ -1123,6 +1888,16 @@ function buildUI() {
         '<span id="am_amb_name" class="am-track-name" title="">—</span>' +
         '<button id="am_lock_amb" class="am-btn-sm am-lock-btn" title="Lock">🔓</button></div>' +
 
+        '<div class="am-section-label">⭐ Player <small style="color:#666">(saved across all chats)</small></div>' +
+        '<div class="am-track-row am-fav-bar">' +
+        '<button id="am_fav_prev" class="am-btn-sm" title="Previous">⏮</button>' +
+        '<button id="am_fav_playpause" class="am-btn-sm" title="Play / Pause">▶</button>' +
+        '<button id="am_fav_next" class="am-btn-sm" title="Next">⏭</button>' +
+        '<button id="am_fav_repeat" class="am-btn-sm" title="Repeat one">🔂</button>' +
+        '<span id="am_fav_now" class="am-track-name" title="">Player empty</span>' +
+        '<button id="am_fav_open" class="am-btn-sm" title="Open player playlist">📂<span id="am_fav_badge" style="display:none;background:#6366f1;color:#fff;border-radius:50%;padding:0 4px;font-size:9px;margin-left:1px">0</span></button></div>' +
+        '<label class="checkbox_label"><input id="am_quick_enabled" type="checkbox"/><span>Quick Player Widget HUD</span></label>' +
+
         '<div style="display:flex;gap:4px;margin:8px 0">' +
         '<div id="am_gen_now" class="menu_button" style="flex:1;font-size:.82em">🎵 Generate</div>' +
         '<div id="am_stop_all" class="menu_button" style="flex:1;font-size:.82em">⏹ Stop</div>' +
@@ -1208,6 +1983,7 @@ function settingsToUI() {
     $('#am_gen_start').prop('checked', s.generateOnChatStart);
     $('#am_llm_params').prop('checked', s.llmMusicParams);
     $('#am_show_gal').prop('checked', s.showGallery);
+    $('#am_quick_enabled').prop('checked', s.quickPlayerEnabled);
     $('#am_lib_on').prop('checked', s.libraryEnabled);
     $('#am_lib_shuffle').prop('checked', s.libraryShuffle);
     $('#am_lib_autoplay').prop('checked', s.libraryAutoplay);
@@ -1232,6 +2008,7 @@ function settingsToUI() {
     populateProfileDropdown();
     $('[data-gal]').toggle(s.showGallery);
     syncPlayerUI(); updateGalleryBadge(); updateLibraryUI(); updatePresetsUI(); syncEngineUI();
+    updateFavBadge(); syncQuickPlayerHUD();
 }
 
 function bindUI() {
@@ -1242,13 +2019,13 @@ function bindUI() {
     $('#am_gen_start').on('change', function () { s.generateOnChatStart = $(this).prop('checked'); saveSettingsDebounced(); });
     $('#am_llm_params').on('change', function () { s.llmMusicParams = $(this).prop('checked'); saveSettingsDebounced(); });
     $('#am_show_gal').on('change', function () { s.showGallery = $(this).prop('checked'); $('[data-gal]').toggle(s.showGallery); saveSettingsDebounced(); });
-    $('#am_lib_on').on('change', function () { s.libraryEnabled = $(this).prop('checked'); saveSettingsDebounced(); });
+    $('#am_lib_on').on('change', function () { s.libraryEnabled = $(this).prop('checked'); applyLoopFlags(); saveSettingsDebounced(); });
     $('#am_lib_shuffle').on('change', function () { s.libraryShuffle = $(this).prop('checked'); saveSettingsDebounced(); });
-    $('#am_lib_autoplay').on('change', function () { s.libraryAutoplay = $(this).prop('checked'); saveSettingsDebounced(); });
+    $('#am_lib_autoplay').on('change', function () { s.libraryAutoplay = $(this).prop('checked'); applyLoopFlags(); saveSettingsDebounced(); });
     $('#am_auto_delete').on('change', function () { s.autoDeleteOnChatRemove = $(this).prop('checked'); saveSettingsDebounced(); });
     $('#am_every_n').on('change', function () { s.checkEveryN = Math.max(1, parseInt($(this).val()) || 1); $(this).val(s.checkEveryN); saveSettingsDebounced(); });
-    $('#am_amb_loop').on('change', function () { s.ambientLoop = $(this).prop('checked'); if (state.ambientAudio) state.ambientAudio.loop = s.ambientLoop; saveSettingsDebounced(); });
-    $('#am_mus_loop').on('change', function () { s.musicLoop = $(this).prop('checked'); if (state.musicAudio) state.musicAudio.loop = s.musicLoop; saveSettingsDebounced(); });
+    $('#am_amb_loop').on('change', function () { s.ambientLoop = $(this).prop('checked'); applyLoopFlags(); saveSettingsDebounced(); });
+    $('#am_mus_loop').on('change', function () { s.musicLoop = $(this).prop('checked'); applyLoopFlags(); saveSettingsDebounced(); });
 
     var sn = function (sel, key) { $(sel).on('change', function () { s[key] = parseFloat($(this).val()) || DEFAULTS[key]; saveSettingsDebounced(); }); };
     // duration/steps/cfg are now stored per-engine: write through setEngineParam so
@@ -1358,7 +2135,7 @@ function bindUI() {
         state.currentAmbientPrompt = ''; state.currentMusicPrompt = ''; state.lastGenerateTime = 0; processSceneChange(true);
     });
     $('#am_stop_all').on('click', function () {
-        stopAudio('ambient'); stopAudio('music'); state.currentAmbientPrompt = ''; state.currentMusicPrompt = ''; updateStatus('idle');
+        stopAudio('ambient'); stopAudio('music'); stopFavorites(); state.currentAmbientPrompt = ''; state.currentMusicPrompt = ''; updateStatus('idle');
     });
     $('#am_test').on('click', async function () {
         var url = getComfyUrl().replace(/\/+$/, '');
@@ -1370,74 +2147,413 @@ function bindUI() {
     $('#am_open_gal').on('click', openGallery);
     $('#am_play_lib_amb').on('click', function () { playNextFromLibrary('ambient'); });
     $('#am_play_lib_mus').on('click', function () { playNextFromLibrary('music'); });
+
+    $('#am_fav_open, #am_quick_playlist_full').on('click', openFavPlayer);
+    $('#am_fav_playpause').on('click', toggleFavPlayPause);
+    $('#am_quick_music').on('click', function () { toggleFavoriteChannel('music'); });
+    $('#am_quick_ambient').on('click', function () { toggleFavoriteChannel('ambient'); });
+    $('#am_fav_next, #am_quick_next').on('click', playNextFavorite);
+    $('#am_fav_prev, #am_quick_prev').on('click', playPrevFavorite);
+    $('#am_fav_repeat, #am_quick_repeat').on('click', toggleFavRepeatOne);
+    $('#am_quick_enabled').on('change', function () {
+        s.quickPlayerEnabled = this.checked;
+        syncQuickPlayerHUD();
+        saveSettingsDebounced();
+    });
+    $('#am_quick_toggle').on('click', function () {
+        s.quickPlayerExpanded = !s.quickPlayerExpanded;
+        syncQuickPlayerHUD();
+        saveSettingsDebounced();
+    });
+    $('#am_quick_playlist').on('click', function () {
+        state.quickQueueOpen = !state.quickQueueOpen;
+        syncQuickPlayerHUD();
+    });
+    $('#am_quick_queue_list').on('click', '.am-quick-queue-track', function () {
+        toggleFavoriteTrack(Number(this.dataset.index));
+    });
+    bindQuickPlayerHUD();
+    syncFavRepeatBtn();
 }
 
 /* ============ EVENTS ============ */
+/* Identity of the turn currently at the end of the chat.
+   SillyTavern REPLAYS the opening turn on every load: getChatResult() in
+   script.js emits MESSAGE_RECEIVED('first_message') whenever the chat holds
+   exactly ONE message — the condition is `chat.length === 1`, not "the chat was
+   just created". This is the SECOND door into the bug fixed on 2026-08-08: that
+   fix taught onChatChanged to decide by the LIBRARY instead of the message
+   count, but this handler was left deciding by nothing at all. With the default
+   checkEveryN of 1, every reopen of an unwritten chat spent an analyseAudio call
+   and — because onChatChanged clears currentAmbientPrompt, so the analysis has
+   no baseline to call unchanged — usually a full ACE Step render of a duplicate
+   track. Index alone is not identity: a swipe reuses it, so the text is
+   fingerprinted too. */
+function amTurnStamp() {
+    var ctx = getContext();
+    var chat = ctx ? ctx.chat : null;
+    if (!Array.isArray(chat) || chat.length === 0) return "";
+    var idx = chat.length - 1;
+    var mes = String((chat[idx] && chat[idx].mes) || "");
+    var h = 0;
+    for (var i = 0; i < mes.length; i++) h = ((h << 5) - h + mes.charCodeAt(i)) | 0;
+    return idx + ":" + mes.length + ":" + (h >>> 0).toString(36);
+}
+
 function onMessage() {
+    if (amSlayOwnsScreen()) return;
     if (!S().enabled) return;
+    /* Replay guard, see amTurnStamp(). The stamp is kept in the per-chat store
+       (extension_settings.savedTracks[chatKey]) — the same place that already
+       decides whether this chat has been scored, and one that survives the
+       reload the replay rides in on. state.* would not: onChatChanged clears it.
+       BEFORE the counter, so a replay cannot shift the checkEveryN cadence. */
+    var amStamp = amTurnStamp();
+    if (amStamp) {
+        /* getChatStore() is a LAZY getter — asking it creates an entry. Only ask
+           when there is a real turn to record, so an empty chat never mints a
+           store for a conversation nobody is having (§7). */
+        var amStore = getChatStore();
+        if (amStore._lastTurn === amStamp) return;
+        amStore._lastTurn = amStamp;
+        saveSettingsDebounced();
+    }
+
     state.messageCounter++; var every = S().checkEveryN || 1;
     if (state.messageCounter % every !== 0) return;
-    setTimeout(processSceneChange, 2000);
+    /* GM Turn (§9.1, Shell Engines layer 4b): while the Game Shell drives the
+       turn, the reply's <gm> block carries a "music" brief and the Shell routes
+       it straight through AutoMusicAPI.playBrief — same generation, zero LLM.
+       The guard sits INSIDE the timer on purpose: a turn that came back without
+       a block releases the flag immediately, and by the time this fires (+2s)
+       the flag is already down, so nothing is starved.
+       The counter above still ticks — otherwise the checkEveryN cadence would
+       drift for the whole Shell session. */
+    setTimeout(function () {
+        if (amSlayOwnsScreen()) return;
+        if (typeof window !== 'undefined' && window.RPGShellDriving) return;
+        processSceneChange();
+    }, 2000);
 }
 function onChatChanged() {
     var newChatKey = getChatKey();
     if (newChatKey === state.lastChatKey && state.lastChatKey !== null) { updateLibraryUI(); return; }
     state.lastChatKey = newChatKey;
 
-    stopAudio('ambient'); stopAudio('music');
+    /* A host score handed over with endBrief(stop:false) plays THROUGH this
+       switch. Without it the boot track died here and the player heard silence
+       until the campaign's own track finished rendering — ACE Step takes
+       minutes, so "the music disappeared" was the whole experience. One-shot:
+       the very next chat change silences it like any other track. */
+    var carry = state.carryTrack;
+    state.carryTrack = null;
+    var keepChan = '';
+    if (carry && carry.channel && carry.url) {
+        var a = carry.channel === 'ambient' ? state.ambientAudio : state.musicAudio;
+        if (a && a.src && String(a.src).indexOf(carry.url) !== -1) keepChan = carry.channel;
+    }
+    if (keepChan !== 'ambient') stopAudio('ambient');
+    if (keepChan !== 'music') stopAudio('music');
     state.currentAmbientPrompt = ''; state.currentMusicPrompt = '';
     state.lastGenerateTime = 0; state.messageCounter = 0;
     state.ambientLibIndex = -1; state.musicLibIndex = -1;
     updateStatus('idle'); $('#am_amb_name').text('—'); $('#am_mus_name').text('—');
     updateLibraryUI();
 
-    if (!S().enabled) return;
+    if (!S().enabled || amSlayOwnsScreen()) return;
 
-    // Determine whether this is a brand-new chat (only the greeting is present)
-    // or a chat with existing history that the user is re-opening.
+    /* RESUME FIRST, generate second — and the deciding fact is the LIBRARY, not
+       the message counter (fix 2026-08-08). Message count answers "has the user
+       written here", which is NOT the same question as "has this chat been
+       scored". A chat created, scored, and left unwritten stays at chat.length
+       <= 1 forever, so `isFreshChat` was permanently true for it: its saved
+       tracks were never resumed on reopen, and every reopen instead burned an
+       analyseAudio call plus a full ACE Step render on a duplicate track. */
+    var s = S();
+    var ambList = s.libraryEnabled ? getChatTracks('ambient') : null;
+    var musList = s.libraryEnabled ? getChatTracks('music') : null;
+    var resumed = false;
+
+    /* keepChan is the host's carried boot score — it OWNS that channel through
+       this switch (see the carry above), so a resume must not stomp it. */
+    if (s.ambientEnabled && keepChan !== 'ambient' && ambList && ambList.length) {
+        state.ambientLibIndex = ambList.length - 1;
+        playFromLibrary('ambient', ambList[ambList.length - 1]);
+        resumed = true;
+    }
+    if (s.musicEnabled && keepChan !== 'music' && musList && musList.length) {
+        state.musicLibIndex = musList.length - 1;
+        playFromLibrary('music', musList[musList.length - 1]);
+        resumed = true;
+    }
+    if (resumed) return;
+
+    /* Nothing saved for this chat. Generating on open is for a chat that has no
+       history either — a chat the user has been writing in is scored by the
+       per-message pass, not on open (unchanged behaviour). */
     var ctx = getContext();
     var chatLen = (ctx && ctx.chat) ? ctx.chat.length : 0;
-    var isFreshChat = chatLen <= 1; // only the greeting → fresh chat
+    if (chatLen > 1) return;            // history but no tracks → stay silent, as before
+    if (!S().generateOnChatStart) return;
 
-    if (isFreshChat) {
-        // Fresh chat: generate from the greeting if "Generate on chat start" is enabled.
-        if (S().generateOnChatStart) {
-            var delay = (S().startDelay || 8) * 1000;
-            setTimeout(function () {
-                var text = getRecentText(S().contextMessages || 5);
-                if (text && text.trim().length > 20) {
-                    state.currentAmbientPrompt = '';
-                    state.currentMusicPrompt = '';
-                    processSceneChange(true);
-                }
-            }, delay);
+    var delay = (S().startDelay || 8) * 1000;
+    setTimeout(function () {
+        if (amSlayOwnsScreen()) return;
+        /* the host already scored THIS chat (Character Library hands the
+           campaign's opener score straight to playBrief): generating
+           again would be a duplicate track AND a wasted analyseAudio
+           call. Checked inside the timer — the host's kick may land
+           during the delay. */
+        if (state.hostScoredChat && state.hostScoredChat === getChatKey()) return;
+        var text = getRecentText(S().contextMessages || 5);
+        if (text && text.trim().length > 20) {
+            state.currentAmbientPrompt = '';
+            state.currentMusicPrompt = '';
+            processSceneChange(true);
         }
-        return;
-    }
+    }, delay);
+}
 
-    // Existing chat with history: do NOT generate. Instead resume the last saved
-    // track(s) for this chat from the library, if available.
-    if (!S().libraryEnabled) return;
+/* ============ EXTERNAL BRIDGE (window.AutoMusicAPI) ============ */
+// Additive facade for sibling extensions (Character Library's campaign boot
+// et al.): accepts a ONE-SENTENCE mood brief and routes it STRAIGHT through
+// the existing generateAudioQueued() seam — ZERO LLM calls (analyseAudio is
+// bypassed; ACE Step self-randomizes bpm/keyscale/timesig when musicParams
+// is null). Nothing internal calls these functions; with the master switch
+// off every call is a cheap refusal, so behavior is unchanged when unused.
 
-    var ambList = getChatTracks('ambient');
-    var musList = getChatTracks('music');
+// True when the master switch is on and at least one channel can play.
+function amApiIsReady() {
+    try {
+        var s = S();
+        return !!(s && s.enabled && (s.musicEnabled || s.ambientEnabled));
+    } catch (e) { return false; }
+}
 
-    if (S().ambientEnabled && ambList && ambList.length) {
-        var lastAmb = ambList[ambList.length - 1];
-        state.ambientLibIndex = ambList.length - 1;
-        playFromLibrary('ambient', lastAmb);
+// amApiPlayBrief(brief, opts) -> boolean.
+// opts.channel: 'music' (default) | 'ambient'. Returns true when the brief
+// was ACCEPTED (generation queued — audio follows minutes later), false on
+// any refusal (disabled, locked channel, empty brief). Fire-and-forget by
+// design: the caller never waits for ComfyUI.
+//
+// opts.session (string) marks the request as EPHEMERAL — score for a host's
+// boot screens, not a track of any chat:
+//   * it is never filed in the library and never added to the gallery;
+//   * when the audio finally arrives (ACE Step needs minutes) it is PLAYED
+//     ONLY IF that session is still the live one — otherwise it is dropped
+//     silently. Without this, a campaign boot's track used to land minutes
+//     later in whatever chat happened to be open by then (typically the
+//     system chat the user fell back to), start playing out of nowhere and
+//     file itself in that chat's library.
+// A request WITHOUT opts.session keeps the old behavior (filed under the
+// chat open at completion time). No cooldown is burned and no
+// own-generation flag is set — this path makes no LLM call.
+function amApiPlayBrief(brief, opts) {
+    try {
+        opts = (opts && typeof opts === 'object') ? opts : {};
+        var s = S();
+        if (!s || !s.enabled) return false;
+        var channel = opts.channel === 'ambient' ? 'ambient' : 'music';
+        var refused = (channel === 'ambient')
+            ? (!s.ambientEnabled || s.ambientLocked)
+            : (!s.musicEnabled || s.musicLocked);
+        if (refused) return false;
+        var prompt = String(brief == null ? '' : brief).trim().substring(0, 300);
+        if (!prompt) return false;
+        var session = (typeof opts.session === 'string' && opts.session) ? opts.session : '';
+        if (session) state.briefSession = session;
+        /* A brief WITHOUT a session is a real track for the chat that is open
+           now — remember which chat, so our own on-chat-start pass stands down
+           instead of generating a second one over it. Recorded on ACCEPT, not
+           on arrival: the point is to beat the startDelay timer, which fires
+           long before ACE Step returns. */
+        else state.hostScoredChat = getChatKey();
+        updateStatus('gen-' + channel);
+        generateAudioQueued(channel, prompt, null).then(function (url) {
+            if (!url) { updateStatus(state.ambientPlaying || state.musicPlaying ? 'playing' : 'idle'); return; }
+            /* the boot screens are long gone — drop the track entirely */
+            if (session && state.briefSession !== session) {
+                updateStatus(state.ambientPlaying || state.musicPlaying ? 'playing' : 'idle');
+                return;
+            }
+            var live = S();
+            if (!session) {
+                addToGallery(channel, prompt, url, null);
+                if (live.libraryEnabled) addTrackToLibrary(channel, prompt, url, null, getChatKey());
+            }
+            if (channel === 'ambient') {
+                state.currentAmbientPrompt = prompt;
+                $('#am_amb_name').text(prompt).attr('title', prompt);
+            } else {
+                state.currentMusicPrompt = prompt;
+                $('#am_mus_name').text(prompt).attr('title', prompt);
+            }
+            playAudio(channel, url);
+            if (session) state.briefTrack = { session: session, channel: channel, url: url };
+            toastr.info('🎵 ' + prompt.substring(0, 60), 'AutoMusic', { timeOut: 4000 });
+        }).catch(function (e) {
+            console.error(L, 'playBrief generation error:', e);
+            updateStatus(state.ambientPlaying || state.musicPlaying ? 'playing' : 'idle');
+        });
+        return true;
+    } catch (e) {
+        console.error(L, 'playBrief error:', e);
+        return false;
     }
-    if (S().musicEnabled && musList && musList.length) {
-        var lastMus = musList[musList.length - 1];
-        state.musicLibIndex = musList.length - 1;
-        playFromLibrary('music', lastMus);
+}
+
+// amApiEndBrief(session, opts) -> boolean (true = this call ended the session).
+// The host calls it when its boot screens are done — whether the user picked
+// something or dismissed. Any generation still in flight for that session is
+// discarded on arrival, and opts.stop !== false stops the session's track if
+// it is the one currently playing. Stale tokens are ignored, so a late call
+// can never cut off a newer session's music.
+function amApiEndBrief(session, opts) {
+    try {
+        opts = (opts && typeof opts === 'object') ? opts : {};
+        var token = (typeof session === 'string' && session) ? session : '';
+        /* a token is REQUIRED: without it a careless caller could silently kill
+           another host's live session — the same protection as the stale check */
+        if (!token) return false;
+        if (state.briefSession && state.briefSession !== token) return false;   /* stale */
+        var track = state.briefTrack;
+        state.briefSession = null;
+        state.briefTrack = null;
+        if (opts.stop === false) {
+            /* "leave it playing" now means through the chat change the host is
+               about to make, not just until it — see onChatChanged's carry. */
+            state.carryTrack = track ? { channel: track.channel, url: track.url } : null;
+            return true;
+        }
+        if (!track) return true;
+        if (track.session !== token) return true;
+        var live = track.channel === 'ambient' ? state.ambientAudio : state.musicAudio;
+        /* only silence OUR track — a newer one may already own the channel */
+        if (live && live.src && String(live.src).indexOf(track.url) !== -1) stopAudio(track.channel);
+        return true;
+    } catch (e) {
+        console.error(L, 'endBrief error:', e);
+        return false;
     }
+}
+
+// Promise-based generation seam for applications that need the finished file.
+// It deliberately bypasses AutoMusic's LLM analysis: callers provide the final
+// English audio-model prompt. The result can optionally be persisted to the ST
+// file store and/or added to AutoMusic's normal gallery/library.
+async function amApiGenerateTrack(brief, opts) {
+    opts = (opts && typeof opts === 'object') ? opts : {};
+    var s = S(), channel = opts.channel === 'ambient' ? 'ambient' : 'music';
+    if (!s || !s.enabled) throw new Error('AutoMusic is disabled');
+    if (channel === 'ambient' ? (!s.ambientEnabled || s.ambientLocked) : (!s.musicEnabled || s.musicLocked)) {
+        throw new Error(channel + ' channel is disabled or locked');
+    }
+    var prompt = String(brief == null ? '' : brief).trim().substring(0, 1200);
+    if (!prompt) throw new Error('Empty music prompt');
+    var params = opts.params && typeof opts.params === 'object' ? opts.params : null;
+    updateStatus('gen-' + channel);
+    var url = await generateAudioQueued(channel, prompt, params);
+    if (!url) throw new Error('Audio generation failed');
+    var result = {
+        id: 'external_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+        type: channel, prompt: prompt, url: url, path: null, params: params,
+        time: new Date().toISOString(), filename: null,
+    };
+    if (opts.persist) {
+        var saved = await saveAudioToLibrary(channel, prompt, url, params);
+        if (saved) {
+            result.filename = saved.filename || null;
+            result.path = saved.path || null;
+            result.url = saved.url || result.url;
+        }
+    }
+    if (opts.gallery !== false) addToGallery(channel, prompt, result.url, params);
+    if (opts.library) {
+        var entry = addTrackToLibrary(channel, prompt, result.url, params, getChatKey());
+        if (entry) result.libraryId = entry.id;
+    }
+    updateStatus(state.ambientPlaying || state.musicPlaying ? 'playing' : 'idle');
+    return result;
+}
+
+async function amApiPersistTrack(track) {
+    if (!track || !(track.url || track.path)) throw new Error('Track URL is missing');
+    var channel = track.type === 'ambient' ? 'ambient' : 'music';
+    var source = getTrackPlayUrl(track);
+    var saved = await saveAudioToLibrary(channel, track.prompt || track.title || 'Phone track', source, track.params || null);
+    if (!saved) throw new Error('Could not persist track');
+    return Object.assign({}, track, saved, { url:saved.url || source, type:channel });
+}
+
+function amStopTemporaryInternal(resume) {
+    var o = state.externalOverride;
+    if (!o) return false;
+    if (o.audio) { o.audio._stopping = true; o.audio.pause(); o.audio.removeAttribute('src'); o.audio.load(); }
+    state.externalOverride = null;
+    if (resume !== false) {
+        if (o.baseAudio && o.baseWasPlaying && o.baseAudio.src) o.baseAudio.play().catch(function () {});
+        if (o.favoriteAudio && o.favoriteWasPlaying && o.favoriteAudio.src) o.favoriteAudio.play().catch(function () {});
+    }
+    syncPlayerUI(); syncFavPlayerUI();
+    updateStatus(state.ambientPlaying || (state.musicAudio && !state.musicAudio.paused) ? 'playing' : 'idle');
+    return true;
+}
+
+function amApiPlayTemporary(track, opts) {
+    opts = (opts && typeof opts === 'object') ? opts : {};
+    var url = typeof track === 'string' ? track : getTrackPlayUrl(track || {});
+    if (!url) return null;
+    /* Replacing one phone track with another must retain the ORIGINAL music
+       resume point. Otherwise the first override is cleared while the base is
+       paused, and stopping the second track can no longer resume it. */
+    var previous = state.externalOverride;
+    var base = previous ? previous.baseAudio : state.musicAudio;
+    var fav = previous ? previous.favoriteAudio : (state.fav.music && state.fav.music.audio);
+    var baseWasPlaying = previous ? previous.baseWasPlaying : !!(base && !base.paused);
+    var favoriteWasPlaying = previous ? previous.favoriteWasPlaying : !!(fav && !fav.paused);
+    if (previous) amStopTemporaryInternal(false);
+    var token = 'temporary_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    var audio = new Audio(url);
+    audio.preload = 'auto'; audio.loop = !!opts.loop;
+    audio.volume = typeof opts.volume === 'number' ? Math.max(0, Math.min(1, opts.volume)) : (S().musicMuted ? 0 : (S().musicVolume || 0.3));
+    state.externalOverride = {
+        token:token, audio:audio,
+        baseAudio:base, baseWasPlaying:baseWasPlaying,
+        favoriteAudio:fav, favoriteWasPlaying:favoriteWasPlaying,
+    };
+    if (base && !base.paused) base.pause();
+    if (fav && !fav.paused) fav.pause();
+    audio.addEventListener('ended', function(){ if (!audio.loop && state.externalOverride && state.externalOverride.token === token) amStopTemporaryInternal(true); });
+    audio.addEventListener('error', function(){ if (state.externalOverride && state.externalOverride.token === token) amStopTemporaryInternal(true); });
+    audio.play().catch(function () {});
+    return token;
+}
+
+function amApiStopTemporary(token, opts) {
+    opts = (opts && typeof opts === 'object') ? opts : {};
+    if (!state.externalOverride) return false;
+    if (token && state.externalOverride.token !== token) return false;
+    return amStopTemporaryInternal(opts.resume !== false);
+}
+
+function amApiGetTemporaryState() {
+    var o = state.externalOverride;
+    return o ? { token:o.token, playing:!!(o.audio && !o.audio.paused), currentTime:o.audio ? o.audio.currentTime : 0, duration:o.audio ? o.audio.duration : 0 } : null;
+}
+
+function amApiSetTemporaryOptions(opts) {
+    var o = state.externalOverride;
+    if (!o || !o.audio || !opts || typeof opts !== 'object') return false;
+    if (typeof opts.volume === 'number') o.audio.volume = Math.max(0, Math.min(1, opts.volume));
+    if (typeof opts.loop === 'boolean') o.audio.loop = opts.loop;
+    return true;
 }
 
 /* ============ INIT ============ */
 jQuery(async function () {
     var tgt = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
     tgt.append(buildUI());
+    $('#form_sheld').prepend($('<div id="am_quick_anchor" hidden></div>').append(buildQuickPlayerHUD()));
     loadSettings(); settingsToUI(); bindUI();
 
     // Optional: load the slash-command runner used to switch connection
@@ -1456,7 +2572,33 @@ jQuery(async function () {
     // Connection Manager extension is actually loaded.
     populateProfileDropdown();
 
-    state.lastChatKey = getChatKey();
+    // External bridge (Tact 0-1 polish): mood-brief -> audio with zero LLM
+    // calls. Additive — nothing internal depends on it.
+    if (typeof window !== 'undefined') {
+        window.AutoMusicAPI = {
+            version: AM_VERSION,
+            isReady: amApiIsReady,
+            playBrief: amApiPlayBrief,
+            /* Ephemeral boot score: pass opts.session to playBrief, then end
+               it here when the host's boot screens close (either outcome).
+               v1.2.0: endBrief(stop:false) now CARRIES the track through the
+               host's next chat change, and a session-less brief marks the chat
+               as host-scored so our on-chat-start pass stands down. */
+            endBrief: amApiEndBrief,
+            generateTrack: amApiGenerateTrack,
+            persistTrack: amApiPersistTrack,
+            playTemporary: amApiPlayTemporary,
+            stopTemporary: amApiStopTemporary,
+            getTemporaryState: amApiGetTemporaryState,
+            setTemporaryOptions: amApiSetTemporaryOptions,
+        };
+    }
+
+    /* lastChatKey stays NULL here on purpose. It means "a chat we have already
+       handled", and at init we have handled nothing — seeding it with whatever
+       chat happens to be resolvable at extension-load time made the FIRST
+       CHAT_CHANGED early-return whenever ST had already restored a chat by
+       then, so a page reload landed in that chat with no resume at all. */
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessage);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
 
@@ -1467,5 +2609,8 @@ jQuery(async function () {
     // interrupted by a page reload while we were on the analysis profile.
     setTimeout(function () { recoverProfileIfNeeded(); }, 1500);
 
-    console.log(L, 'v1.9.3 loaded — fresh-chat gating + resume last library track on existing chats');
+    // Move ComfyUI-only tracks (favorites + library) onto SillyTavern copies.
+    setTimeout(function () { rescueComfyLinks(false).catch(function (e) { console.warn(L, 'rescue failed', e); }); }, 3000);
+
+    console.log(L, 'v' + AM_VERSION + ' loaded');
 });
